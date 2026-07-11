@@ -340,7 +340,7 @@ def cmd_download(args: argparse.Namespace, config: Config) -> int:
         exclude_patterns=exclude_patterns,
     )
 
-    print()  # New line after progress
+    manager.finish_progress_line()  # Close the in-place progress line if open
 
     if success:
         print("Transfer completed successfully!")

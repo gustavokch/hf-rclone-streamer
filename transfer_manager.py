@@ -6,6 +6,7 @@ and state checkpointing for resume capability.
 """
 
 import os
+import sys
 import json
 import hashlib
 import threading
@@ -104,6 +105,15 @@ class TransferManager:
         # updates one shard's state from the upload worker thread while the
         # main thread updates another's, and both write the shared JSON file.
         self._state_lock = threading.RLock()
+
+        # Serializes stdout between the in-place progress line (drawn from both
+        # the download/main and upload/worker threads via _notify_progress) and
+        # status messages, so a status can't glue onto a parked progress line and
+        # the two threads can't interleave a partial line. Lock order is always
+        # _state_lock -> _output_lock (only _notify_progress nests both), so no
+        # deadlock.
+        self._output_lock = threading.Lock()
+        self._progress_line_open = False
 
         # Cancellation token for the current transfer. A fresh one is created
         # at the start of each transfer_model() call; setting it terminates
@@ -226,7 +236,34 @@ class TransferManager:
         self._upload_estimator.sample(now, progress.uploaded_bytes)
         if self.progress_callback:
             self._populate_rates(progress)
-            self.progress_callback(progress)
+            with self._output_lock:
+                self.progress_callback(progress)
+                self._progress_line_open = True
+
+    def _print_status(self, msg: str) -> None:
+        """Print a status line on its own row, closing any open progress line.
+
+        The progress callback leaves its line without a trailing newline, so a
+        status message would otherwise glue onto the parked ETA. Serialized with
+        the progress draw under ``_output_lock`` so the download (main) and upload
+        (worker) threads can't interleave a partial line.
+        """
+        with self._output_lock:
+            if self._progress_line_open:
+                # Close the parked progress line: on a TTY clear the row and
+                # rewrite on it; when redirected, break to a fresh log line.
+                sys.stdout.write("\r\033[K" if sys.stdout.isatty() else "\n")
+                self._progress_line_open = False
+            sys.stdout.write(msg + "\n")
+            sys.stdout.flush()
+
+    def finish_progress_line(self) -> None:
+        """Close the in-place progress line if one is open (call at transfer end)."""
+        with self._output_lock:
+            if self._progress_line_open:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                self._progress_line_open = False
 
     def _populate_rates(self, progress: TransferProgress) -> None:
         """Set download/upload rates and ETA on ``progress``.
@@ -407,7 +444,7 @@ class TransferManager:
                                 Path(state.cache_path).unlink()
                             except FileNotFoundError:
                                 pass
-                        print(f"Skipping {file.path} (already transferred)")
+                        self._print_status(f"Skipping {file.path} (already transferred)")
                         continue
 
                     if not self._transfer_file(
@@ -417,7 +454,7 @@ class TransferManager:
                     ):
                         success = False
                         if not self._retry_or_fail(key):
-                            print(f"Failed to transfer {file.path} after retries")
+                            self._print_status(f"Failed to transfer {file.path} after retries")
                             continue
         except KeyboardInterrupt:
             print("\nCancellation requested — terminating in-flight transfer...")
@@ -463,7 +500,7 @@ class TransferManager:
 
         try:
             if state.status != "cached" or not Path(cache_path).exists():
-                print(f"Downloading {file_info.path}...")
+                self._print_status(f"Downloading {file_info.path}...")
                 state.status = "downloading"
                 self._update_state(key)
 
@@ -490,7 +527,7 @@ class TransferManager:
             return cache_path
 
         except Exception as e:
-            print(f"Error downloading {file_info.path}: {e}")
+            self._print_status(f"Error downloading {file_info.path}: {e}")
             state.status = "failed"
             state.error = str(e)
             state.retries += 1
@@ -521,7 +558,7 @@ class TransferManager:
         state = self.states[key]
 
         try:
-            print(f"Uploading {file_info.path}...")
+            self._print_status(f"Uploading {file_info.path}...")
             state.status = "uploading"
             self._update_state(key)
 
@@ -553,11 +590,11 @@ class TransferManager:
                 except FileNotFoundError:
                     pass
 
-            print(f"Complete: {file_info.path}")
+            self._print_status(f"Complete: {file_info.path}")
             return True
 
         except Exception as e:
-            print(f"Error uploading {file_info.path}: {e}")
+            self._print_status(f"Error uploading {file_info.path}: {e}")
             state.status = "failed"
             state.error = str(e)
             state.retries += 1
@@ -629,7 +666,7 @@ class TransferManager:
             if not ok:
                 # _upload_file already set status=failed, error, retries+=1.
                 if not self._retry_or_fail(key):
-                    print(f"Failed to transfer {self.states[key].filename} after retries")
+                    self._print_status(f"Failed to transfer {self.states[key].filename} after retries")
             return None, ok
 
         # The `with` block guarantees the worker is fully shut down before this
@@ -658,7 +695,7 @@ class TransferManager:
                                 Path(state.cache_path).unlink()
                             except FileNotFoundError:
                                 pass
-                        print(f"Skipping {file.path} (already transferred)")
+                        self._print_status(f"Skipping {file.path} (already transferred)")
                         continue
 
                     # Download on the main thread (blocks). The previous shard's
@@ -674,7 +711,7 @@ class TransferManager:
                         success = False
                         pending_upload, _ = _drain(pending_upload)
                         if not self._retry_or_fail(key):
-                            print(f"Failed to transfer {file.path} after retries")
+                            self._print_status(f"Failed to transfer {file.path} after retries")
                         continue
 
                     # Submit this shard's upload to the worker, THEN join the
@@ -716,7 +753,7 @@ class TransferManager:
             self._update_state(key)
             return False
 
-        print(f"Retrying {state.filename} (attempt {state.retries + 1})...")
+        self._print_status(f"Retrying {state.filename} (attempt {state.retries + 1})...")
         state.status = "pending"
         state.error = None
         self._update_state(key)
