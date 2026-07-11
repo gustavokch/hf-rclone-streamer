@@ -11,11 +11,24 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
-from .config import Config, get_config
-from .hf_api import search_models, get_model_info, format_size, print_model_summary
-from .transfer_manager import TransferManager, TransferProgress
-from .rclone_client import detect_mode, get_free_space, format_size as rclone_format_size
-from .setup import run_setup, quick_check
+# Add script directory to path for imports when running directly
+script_dir = Path(__file__).parent
+if str(script_dir) not in sys.path:
+    sys.path.insert(0, str(script_dir))
+
+try:
+    from .config import Config, get_config
+    from .hf_api import search_models, get_model_info, format_size, print_model_summary
+    from .transfer_manager import TransferManager, TransferProgress
+    from .rclone_client import detect_mode, get_free_space, format_size as rclone_format_size
+    from .setup import run_setup, quick_check
+except ImportError:
+    # Running directly (not as a module)
+    from config import Config, get_config
+    from hf_api import search_models, get_model_info, format_size, print_model_summary
+    from transfer_manager import TransferManager, TransferProgress
+    from rclone_client import detect_mode, get_free_space, format_size as rclone_format_size
+    from setup import run_setup, quick_check
 
 
 def create_parser() -> argparse.ArgumentParser:

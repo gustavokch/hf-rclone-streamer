@@ -14,18 +14,33 @@ from dataclasses import dataclass, asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 
-from .config import Config, get_config
-from .hf_api import (
-    ModelInfo, FileInfo,
-    get_model_info,
-    download_file,
-    format_size as hf_format_size,
-)
-from .rclone_client import (
-    copy_file,
-    get_free_space,
-    format_size as rclone_format_size,
-)
+try:
+    from .config import Config, get_config
+    from .hf_api import (
+        ModelInfo, FileInfo,
+        get_model_info,
+        download_file,
+        format_size as hf_format_size,
+    )
+    from .rclone_client import (
+        copy_file,
+        get_free_space,
+        format_size as rclone_format_size,
+    )
+except ImportError:
+    # Absolute imports for running directly
+    from config import Config, get_config
+    from hf_api import (
+        ModelInfo, FileInfo,
+        get_model_info,
+        download_file,
+        format_size as hf_format_size,
+    )
+    from rclone_client import (
+        copy_file,
+        get_free_space,
+        format_size as rclone_format_size,
+    )
 
 
 @dataclass

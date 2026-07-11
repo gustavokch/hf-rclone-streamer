@@ -337,20 +337,22 @@ sudo dnf install aria2
         if self.has_gdrive_remote():
             print("\n✓ Google Drive remote already configured!")
             remote = "gdrive"  # Assume it's called gdrive
+        elif not remotes:
+            # No remotes at all - need to configure
+            print("\nNo rclone remotes configured.")
+            if input("\nConfigure Google Drive now? (Y/n): ").lower() == "n":
+                return {"success": False, "reason": "No remotes configured"}
+            try:
+                remote = self.guide_rclone_config()
+                print(f"\n✓ Configured remote: {remote}")
+            except SetupError as e:
+                print(f"\n✗ Setup failed: {e}")
+                return {"success": False, "reason": str(e)}
         else:
-            # Guide through rclone config
-            if remotes and not input("\nNo Google Drive remote found. Configure one now? (Y/n): ").lower() == "n":
-                try:
-                    remote = self.guide_rclone_config()
-                    print(f"\n✓ Configured remote: {remote}")
-                except SetupError as e:
-                    print(f"\n✗ Setup failed: {e}")
-                    return {"success": False, "reason": str(e)}
-            else:
-                # Use existing remote
-                print("\nUsing existing remote (first in list):")
-                remote = remotes[0].rstrip(":")
-                print(f"  {remote}")
+            # Use existing remote
+            print("\nUsing existing remote (first in list):")
+            remote = remotes[0].rstrip(":")
+            print(f"  {remote}")
 
         # Suggest mount point
         mount_path = self.suggest_mount_point()
