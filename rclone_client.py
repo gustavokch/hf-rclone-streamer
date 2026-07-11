@@ -14,6 +14,12 @@ import time
 import re
 
 
+try:
+    from .cancel import NO_CANCEL, terminate
+except ImportError:
+    from cancel import NO_CANCEL, terminate
+
+
 # The rclone binary to invoke. Defaults to the FUSE-enabled build so `mount`
 # works on macOS; override via HF_RCLONE_RCLONE_BINARY env var or Config.
 RCLONE_BINARY = os.environ.get("HF_RCLONE_RCLONE_BINARY", "rclone-fuse")
@@ -330,6 +336,7 @@ def copy_to_mount(
     mount_path: Path,
     dest_subdir: str,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    cancel=NO_CANCEL,
 ) -> Path:
     """Copy a file to an rclone mount point.
 
@@ -338,6 +345,7 @@ def copy_to_mount(
         mount_path: Mount point directory.
         dest_subdir: Destination subdirectory (e.g., "/Models/Llama").
         progress_callback: Optional callback(bytes_copied, total_bytes).
+        cancel: Optional CancelToken to abort the copy on Ctrl-C.
 
     Returns:
         Destination file path.
@@ -354,6 +362,8 @@ def copy_to_mount(
             with open(dest_path, "wb") as fdest:
                 copied = 0
                 while True:
+                    if cancel.is_set():
+                        raise CopyError("copy to mount cancelled")
                     chunk = fsrc.read(1024 * 1024)  # 1MB chunks
                     if not chunk:
                         break
@@ -378,6 +388,7 @@ def copy_with_rclone(
     max_retries: int = 3,
     retry_delay: int = 5,
     drive_chunk_size: str = "64M",
+    cancel=NO_CANCEL,
 ) -> None:
     """Copy a file using rclone CLI.
 
@@ -390,6 +401,7 @@ def copy_with_rclone(
         max_retries: Maximum retry attempts.
         retry_delay: Seconds between retries.
         drive_chunk_size: GDrive upload chunk size (default 64M).
+        cancel: Optional CancelToken to terminate rclone on Ctrl-C.
 
     Raises:
         CopyError: If copy fails after all retries.
@@ -416,24 +428,32 @@ def copy_with_rclone(
                 "--stats", "1s",
             ])
 
-            # Run rclone and capture progress
-            process = subprocess.Popen(
+            # Run rclone in its own session so cancellation is deterministic.
+            process = cancel.register(subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-            )
+                start_new_session=True,
+            ))
 
             # Parse progress from output
             size_pattern = re.compile(r"([\d.]+)([KMGT]?iB)")
 
-            for line in process.stdout:
-                # Look for progress info
-                if "Transferred:" in line or "%" in line:
-                    # Extract progress if possible
-                    pass  # Progress parsing would go here
+            try:
+                for line in process.stdout:
+                    if cancel.is_set():
+                        break
+                    # Look for progress info
+                    if "Transferred:" in line or "%" in line:
+                        # Extract progress if possible
+                        pass  # Progress parsing would go here
 
-            return_code = process.wait()
+                return_code = process.wait()
+            finally:
+                cancel.unregister(process)
+                if process.poll() is None:
+                    terminate(process)
 
             if return_code != 0:
                 raise subprocess.CalledProcessError(return_code, cmd)
@@ -442,6 +462,8 @@ def copy_with_rclone(
 
         except subprocess.CalledProcessError as e:
             last_error = e
+            if cancel.is_set():
+                raise CopyError(f"copy cancelled: {src}")
             if attempt < max_retries - 1:
                 time.sleep(retry_delay)
                 continue
@@ -460,6 +482,7 @@ def copy_direct(
     progress_callback: Optional[Callable[[int, int], None]] = None,
     max_retries: int = 3,
     retry_delay: int = 5,
+    cancel=NO_CANCEL,
 ) -> None:
     """Upload a single file directly to the remote via `rclone copyto`.
 
@@ -477,6 +500,7 @@ def copy_direct(
         progress_callback: Optional callback(bytes_copied, total_bytes).
         max_retries: Maximum retry attempts.
         retry_delay: Seconds between retries.
+        cancel: Optional CancelToken to terminate rclone on Ctrl-C.
 
     Raises:
         CopyError: If copy fails after all retries.
@@ -507,25 +531,33 @@ def copy_direct(
             if config_path:
                 cmd.extend(["--config", str(config_path)])
 
-            # Run rclone and capture progress
-            process = subprocess.Popen(
+            # Run rclone in its own session so cancellation is deterministic.
+            process = cancel.register(subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-            )
+                start_new_session=True,
+            ))
 
             if progress_callback:
                 progress_callback(0, total_size)
 
-            for line in process.stdout:
-                if progress_callback:
-                    match = pct_pattern.search(line)
-                    if match:
-                        pct = float(match.group(1))
-                        progress_callback(int(total_size * pct / 100), total_size)
+            try:
+                for line in process.stdout:
+                    if cancel.is_set():
+                        break
+                    if progress_callback:
+                        match = pct_pattern.search(line)
+                        if match:
+                            pct = float(match.group(1))
+                            progress_callback(int(total_size * pct / 100), total_size)
 
-            return_code = process.wait()
+                return_code = process.wait()
+            finally:
+                cancel.unregister(process)
+                if process.poll() is None:
+                    terminate(process)
 
             if return_code != 0:
                 raise subprocess.CalledProcessError(return_code, cmd)
@@ -536,6 +568,8 @@ def copy_direct(
 
         except subprocess.CalledProcessError as e:
             last_error = e
+            if cancel.is_set():
+                raise CopyError(f"copy cancelled: {src}")
             if attempt < max_retries - 1:
                 time.sleep(retry_delay)
                 continue
@@ -556,6 +590,7 @@ def copy_file(
     progress_callback: Optional[Callable[[int, int], None]] = None,
     max_retries: int = 3,
     retry_delay: int = 5,
+    cancel=NO_CANCEL,
 ) -> None:
     """Copy a file to Google Drive using the appropriate mode.
 
@@ -574,6 +609,7 @@ def copy_file(
         progress_callback: Optional progress callback.
         max_retries: Maximum retry attempts.
         retry_delay: Seconds between retries.
+        cancel: Optional CancelToken to terminate the upload on Ctrl-C.
 
     Raises:
         RcloneError: If operation fails.
@@ -589,13 +625,14 @@ def copy_file(
             progress_callback=progress_callback,
             max_retries=max_retries,
             retry_delay=retry_delay,
+            cancel=cancel,
         )
         return
 
     mode = detect_mode(rclone_path)
 
     if mode.mode == "mount":
-        copy_to_mount(src, mode.path, dest_dir, progress_callback)
+        copy_to_mount(src, mode.path, dest_dir, progress_callback, cancel=cancel)
     else:
         if remote is None:
             remotes = get_remotes(mode.path)
@@ -613,6 +650,7 @@ def copy_file(
             max_retries=max_retries,
             retry_delay=retry_delay,
             drive_chunk_size=drive_chunk_size,
+            cancel=cancel,
         )
 
 

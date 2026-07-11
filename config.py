@@ -29,6 +29,7 @@ class Config:
         "timeout": 300,  # Timeout for operations in seconds
         "use_aria2c": True,  # Use aria2c for downloads (default: True)
         "aria2c_connections": 16,  # Number of connections per file for aria2c
+        "pipeline": True,  # Overlap upload of shard x with download of x+1 (depth-1)
         # --- rclone binary / upload strategy ---
         "rclone_binary": "rclone-fuse",  # FUSE-enabled rclone binary to invoke
         "no_mount": False,  # Bypass FUSE mount; upload via `rclone copyto` directly
@@ -57,6 +58,7 @@ class Config:
         "no_mount": "NO_MOUNT",
         "remote": "REMOTE",
         "drive_chunk_size": "DRIVE_CHUNK_SIZE",
+        "pipeline": "PIPELINE",
     }
 
     def __init__(self, config_file: Optional[Path] = None):
@@ -122,7 +124,7 @@ class Config:
             Parsed value.
         """
         # Boolean values
-        if key in ("cleanup", "resume", "no_mount"):
+        if key in ("cleanup", "resume", "no_mount", "pipeline"):
             return value.lower() in ("1", "true", "yes", "on")
 
         # Integer values
@@ -257,6 +259,11 @@ class Config:
     def aria2c_connections(self) -> int:
         """Get number of aria2c connections per file."""
         return self.get("aria2c_connections", 16)
+
+    @property
+    def pipeline(self) -> bool:
+        """Whether to overlap upload of shard x with download of shard x+1."""
+        return self.get("pipeline", True)
 
     @property
     def rclone_binary(self) -> str:

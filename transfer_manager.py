@@ -8,6 +8,7 @@ and state checkpointing for resume capability.
 import os
 import json
 import hashlib
+import threading
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable
 from dataclasses import dataclass, asdict
@@ -16,6 +17,7 @@ import time
 
 try:
     from .config import Config, get_config
+    from .cancel import CancelToken, NO_CANCEL
     from .hf_api import (
         ModelInfo, FileInfo,
         get_model_info,
@@ -30,6 +32,7 @@ try:
 except ImportError:
     # Absolute imports for running directly
     from config import Config, get_config
+    from cancel import CancelToken, NO_CANCEL
     from hf_api import (
         ModelInfo, FileInfo,
         get_model_info,
@@ -90,6 +93,16 @@ class TransferManager:
         self.states: Dict[str, TransferState] = {}
         self.state_file = self.config.config_dir / "transfer_state.json"
 
+        # Guards self.states and the on-disk state file: the pipelined driver
+        # updates one shard's state from the upload worker thread while the
+        # main thread updates another's, and both write the shared JSON file.
+        self._state_lock = threading.RLock()
+
+        # Cancellation token for the current transfer. A fresh one is created
+        # at the start of each transfer_model() call; setting it terminates
+        # any in-flight aria2c/rclone subprocess so Ctrl-C exits promptly.
+        self._cancel = CancelToken()
+
         # Ensure cache directory exists
         self.cache_dir = self.config.ensure_cache_dir()
 
@@ -126,15 +139,16 @@ class TransferManager:
 
     def _save_state(self) -> None:
         """Save transfer state to disk."""
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        with self._state_lock:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
 
-        data = {
-            key: asdict(state)
-            for key, state in self.states.items()
-        }
+            data = {
+                key: asdict(state)
+                for key, state in self.states.items()
+            }
 
-        with open(self.state_file, "w") as f:
-            json.dump(data, f, indent=2)
+            with open(self.state_file, "w") as f:
+                json.dump(data, f, indent=2)
 
     def _update_state(
         self,
@@ -157,28 +171,29 @@ class TransferManager:
             error: Error message.
             retries: Retry count.
         """
-        if key not in self.states:
-            return
+        with self._state_lock:
+            if key not in self.states:
+                return
 
-        state = self.states[key]
+            state = self.states[key]
 
-        if status is not None:
-            state.status = status
-        if downloaded_bytes is not None:
-            state.downloaded_bytes = downloaded_bytes
-        if uploaded_bytes is not None:
-            state.uploaded_bytes = uploaded_bytes
-        if cache_path is not None:
-            state.cache_path = cache_path
-        if error is not None:
-            state.error = error
-        if retries is not None:
-            state.retries = retries
+            if status is not None:
+                state.status = status
+            if downloaded_bytes is not None:
+                state.downloaded_bytes = downloaded_bytes
+            if uploaded_bytes is not None:
+                state.uploaded_bytes = uploaded_bytes
+            if cache_path is not None:
+                state.cache_path = cache_path
+            if error is not None:
+                state.error = error
+            if retries is not None:
+                state.retries = retries
 
-        state.last_update = time.time()
+            state.last_update = time.time()
 
-        self._save_state()
-        self._notify_progress()
+            self._save_state()
+            self._notify_progress()
 
     def _notify_progress(self) -> None:
         """Notify progress callback if set."""
@@ -289,26 +304,56 @@ class TransferManager:
 
         self._save_state()
 
-        # Transfer each file
-        success = True
-        for file in model_info.files:
-            key = self._get_state_key(model_id, file.path)
-            state = self.states[key]
+        # Fresh cancel token per transfer: setting it (on Ctrl-C, or in the
+        # finally below) terminates the in-flight aria2c/rclone subprocess.
+        # Both paths start their subprocess with start_new_session=True, so a
+        # terminal Ctrl-C does NOT reach it directly — only the token does.
+        self._cancel = CancelToken()
 
-            # Skip if already complete
-            if state.status == "complete" and self.config.resume:
-                print(f"Skipping {file.path} (already transferred)")
-                continue
+        try:
+            # Transfer each file
+            if self.config.pipeline:
+                # Depth-1 pipeline: upload shard x overlaps download of shard x+1.
+                success = self._transfer_model_pipelined(
+                    model_id, model_info.files, dest_dir
+                )
+            else:
+                success = True
+                for file in model_info.files:
+                    key = self._get_state_key(model_id, file.path)
+                    state = self.states[key]
 
-            if not self._transfer_file(
-                model_id=model_id,
-                file_info=file,
-                dest_dir=dest_dir,
-            ):
-                success = False
-                if not self._retry_or_fail(key):
-                    print(f"Failed to transfer {file.path} after retries")
-                    continue
+                    # Skip if already complete
+                    if state.status == "complete" and self.config.resume:
+                        # Reclaim stale cache left by a run that crashed before
+                        # per-file cleanup (only safe for files already uploaded).
+                        if state.cache_path and Path(state.cache_path).exists():
+                            try:
+                                Path(state.cache_path).unlink()
+                            except FileNotFoundError:
+                                pass
+                        print(f"Skipping {file.path} (already transferred)")
+                        continue
+
+                    if not self._transfer_file(
+                        model_id=model_id,
+                        file_info=file,
+                        dest_dir=dest_dir,
+                    ):
+                        success = False
+                        if not self._retry_or_fail(key):
+                            print(f"Failed to transfer {file.path} after retries")
+                            continue
+        except KeyboardInterrupt:
+            print("\nCancellation requested — terminating in-flight transfer...")
+            self._cancel.set()
+            with self._state_lock:
+                self._save_state()
+            raise
+        finally:
+            # Belt-and-suspenders: ensure no subprocess outlives the transfer
+            # even if the except path above is missed. No-op once already set.
+            self._cancel.set()
 
         # Cleanup if requested
         if self.config.cleanup:
@@ -316,37 +361,38 @@ class TransferManager:
 
         return success
 
-    def _transfer_file(
+    def _cache_path_for(self, model_id: str, file_info: FileInfo) -> Path:
+        """Resolve the on-disk cache path for a file."""
+        safe_filename = file_info.path.replace("/", "_")
+        return self.cache_dir / f"{model_id.replace('/', '_')}_{safe_filename}"
+
+    def _download_file(
         self,
         model_id: str,
         file_info: FileInfo,
-        dest_dir: str,
-    ) -> bool:
-        """Transfer a single file.
+        cancel=NO_CANCEL,
+    ) -> Optional[Path]:
+        """Download a single file to cache.
 
         Args:
             model_id: Model ID.
             file_info: File information.
-            dest_dir: Destination directory.
+            cancel: CancelToken to abort the download on Ctrl-C.
 
         Returns:
-            True if successful, False otherwise.
+            Cache path on success, None on failure (state already recorded).
         """
         key = self._get_state_key(model_id, file_info.path)
         state = self.states[key]
-
-        # Generate cache path
-        safe_filename = file_info.path.replace("/", "_")
-        cache_path = self.cache_dir / f"{model_id.replace('/', '_')}_{safe_filename}"
+        cache_path = self._cache_path_for(model_id, file_info)
 
         try:
-            # Download to cache
             if state.status != "cached" or not Path(cache_path).exists():
                 print(f"Downloading {file_info.path}...")
                 state.status = "downloading"
                 self._update_state(key)
 
-                downloaded = download_file(
+                download_file(
                     model_id=model_id,
                     filename=file_info.path,
                     local_path=Path(cache_path),
@@ -355,6 +401,10 @@ class TransferManager:
                     retry_delay=self.config.retry_delay,
                     use_aria2c=self.config.use_aria2c,
                     connections=self.config.aria2c_connections,
+                    progress_callback=lambda downloaded, total: self._update_state(
+                        key, downloaded_bytes=downloaded
+                    ),
+                    cancel=cancel,
                 )
 
                 state.status = "cached"
@@ -362,7 +412,40 @@ class TransferManager:
                 state.downloaded_bytes = file_info.size
                 self._update_state(key)
 
-            # Upload to GDrive
+            return cache_path
+
+        except Exception as e:
+            print(f"Error downloading {file_info.path}: {e}")
+            state.status = "failed"
+            state.error = str(e)
+            state.retries += 1
+            self._update_state(key)
+            return None
+
+    def _upload_file(
+        self,
+        model_id: str,
+        file_info: FileInfo,
+        cache_path: Path,
+        dest_dir: str,
+        cancel=NO_CANCEL,
+    ) -> bool:
+        """Upload a single cached file to GDrive.
+
+        Args:
+            model_id: Model ID.
+            file_info: File information.
+            cache_path: Local cache path to upload.
+            dest_dir: Destination directory.
+            cancel: CancelToken to abort the upload on Ctrl-C.
+
+        Returns:
+            True if successful, False otherwise (state already recorded).
+        """
+        key = self._get_state_key(model_id, file_info.path)
+        state = self.states[key]
+
+        try:
             print(f"Uploading {file_info.path}...")
             state.status = "uploading"
             self._update_state(key)
@@ -379,22 +462,179 @@ class TransferManager:
                 ),
                 max_retries=self.config.max_retries,
                 retry_delay=self.config.retry_delay,
+                cancel=cancel,
             )
 
             state.status = "complete"
             state.uploaded_bytes = file_info.size
             self._update_state(key)
 
+            # Free disk now that the upload succeeded: delete this file's cache
+            # immediately so peak disk stays near one shard (not the whole model).
+            # The end-of-model _cleanup_cache still sweeps anything left on failure.
+            if self.config.cleanup:
+                try:
+                    Path(cache_path).unlink()
+                except FileNotFoundError:
+                    pass
+
             print(f"Complete: {file_info.path}")
             return True
 
         except Exception as e:
-            print(f"Error transferring {file_info.path}: {e}")
+            print(f"Error uploading {file_info.path}: {e}")
             state.status = "failed"
             state.error = str(e)
             state.retries += 1
             self._update_state(key)
             return False
+
+    def _transfer_file(
+        self,
+        model_id: str,
+        file_info: FileInfo,
+        dest_dir: str,
+    ) -> bool:
+        """Transfer a single file sequentially (download then upload).
+
+        Used by the non-pipelined path. The pipelined driver calls
+        ``_download_file`` and ``_upload_file`` directly so they can overlap
+        across shards.
+
+        Args:
+            model_id: Model ID.
+            file_info: File information.
+            dest_dir: Destination directory.
+
+        Returns:
+            True if successful, False otherwise.
+        """
+        cache_path = self._download_file(model_id, file_info, cancel=self._cancel)
+        if cache_path is None:
+            return False
+        return self._upload_file(
+            model_id, file_info, cache_path, dest_dir, cancel=self._cancel
+        )
+
+    def _transfer_model_pipelined(
+        self,
+        model_id: str,
+        files: List[FileInfo],
+        dest_dir: str,
+    ) -> bool:
+        """Transfer files with a depth-1 pipeline.
+
+        Download of shard x+1 runs on the main thread while upload of shard x
+        runs on a single worker thread (``ThreadPoolExecutor(max_workers=1)``),
+        so the two never block each other beyond one shard of lag. The
+        single-worker pool also guarantees uploads never overlap each other.
+
+        Returns:
+            True if all files transferred successfully, False otherwise.
+        """
+        success = True
+        # Set on Ctrl-C (inner handler below) to SIGTERM the in-flight
+        # aria2c/rclone subprocess BEFORE the executor's shutdown(wait=True)
+        # runs — otherwise shutdown blocks on the worker until the transfer
+        # finishes and the process appears to hang.
+        cancel = self._cancel
+        # pending_upload is None or (state_key, Future). Tracked as a tuple so
+        # _drain can apply _retry_or_fail to the shard that actually failed.
+        pending_upload: Optional[tuple] = None
+
+        def _drain(pending: Optional[tuple]) -> tuple:
+            """Wait for the previous upload future, applying retry/fail policy.
+
+            Returns (None, ok) so callers rebind pending_upload to None.
+            """
+            if pending is None:
+                return None, True
+            key, future = pending
+            ok = future.result()  # _upload_file returns bool, never raises
+            if not ok:
+                # _upload_file already set status=failed, error, retries+=1.
+                if not self._retry_or_fail(key):
+                    print(f"Failed to transfer {self.states[key].filename} after retries")
+            return None, ok
+
+        try:
+            # The `with` block guarantees the worker is fully shut down before
+            # this method returns, so _cleanup_cache (back in transfer_model)
+            # can't unlink a file the worker is still reading.
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                # Inner handler: a Ctrl-C during the loop must set the cancel
+                # token BEFORE the `with` exits (which calls shutdown(wait=True)
+                # on the worker). Setting it SIGTERMs the in-flight subprocess so
+                # the worker finishes promptly instead of blocking shutdown for
+                # the rest of the transfer.
+                try:
+                    for file in files:
+                        key = self._get_state_key(model_id, file.path)
+                        state = self.states[key]
+
+                        # Skip files already complete under resume. The pending
+                        # upload still must be drained first so its result counts.
+                        if state.status == "complete" and self.config.resume:
+                            pending_upload, ok = _drain(pending_upload)
+                            if not ok:
+                                success = False
+                            if state.cache_path and Path(state.cache_path).exists():
+                                try:
+                                    Path(state.cache_path).unlink()
+                                except FileNotFoundError:
+                                    pass
+                            print(f"Skipping {file.path} (already transferred)")
+                            continue
+
+                        # Download on the main thread (blocks). The previous
+                        # shard's upload (if any) runs concurrently on the
+                        # worker — this is the overlap: upload(x) ∥ download(x+1).
+                        cache_path = self._download_file(
+                            model_id, file, cancel=cancel
+                        )
+                        if cache_path is None:
+                            # Download failed; state already recorded. Drain
+                            # the pending upload before moving on so its result
+                            # isn't lost (un-resulted futures swallow their
+                            # exceptions).
+                            success = False
+                            pending_upload, _ = _drain(pending_upload)
+                            if not self._retry_or_fail(key):
+                                print(f"Failed to transfer {file.path} after retries")
+                            continue
+
+                        # Submit this shard's upload to the worker, THEN join
+                        # the previous upload. Order matters: submit before
+                        # drain keeps the next iteration's download from
+                        # stalling on the join.
+                        this_upload = executor.submit(
+                            self._upload_file, model_id, file, cache_path,
+                            dest_dir, cancel,
+                        )
+                        pending_upload, ok = _drain(pending_upload)
+                        if not ok:
+                            success = False
+                        pending_upload = (key, this_upload)
+
+                    # Drain the final shard's upload.
+                    pending_upload, ok = _drain(pending_upload)
+                    if not ok:
+                        success = False
+                except KeyboardInterrupt:
+                    # Fires before the `with` exits → before shutdown(wait=True).
+                    cancel.set()
+                    raise
+
+        except KeyboardInterrupt:
+            # Save state so a resume run can pick up. The in-flight subprocess
+            # was already terminated by the inner handler's cancel.set() above,
+            # so the executor's shutdown has already completed by the time we
+            # arrive; this block just persists the checkpoint.
+            with self._state_lock:
+                self._save_state()
+            raise
+
+        return success
 
     def _retry_or_fail(self, key: str) -> bool:
         """Retry a failed transfer or mark as permanently failed.
@@ -425,24 +665,25 @@ class TransferManager:
         Args:
             model_id: Model ID.
         """
-        prefix = model_id.replace("/", "_")
+        with self._state_lock:
+            prefix = model_id.replace("/", "_")
 
-        for file in self.cache_dir.glob(f"{prefix}_*"):
-            try:
-                file.unlink()
-                print(f"Cleaned up: {file.name}")
-            except IOError as e:
-                print(f"Failed to cleanup {file.name}: {e}")
+            for file in self.cache_dir.glob(f"{prefix}_*"):
+                try:
+                    file.unlink()
+                    print(f"Cleaned up: {file.name}")
+                except IOError as e:
+                    print(f"Failed to cleanup {file.name}: {e}")
 
-        # Clean up state entries for this model
-        to_remove = [
-            key for key, state in self.states.items()
-            if state.model_id == model_id and state.status == "complete"
-        ]
-        for key in to_remove:
-            del self.states[key]
+            # Clean up state entries for this model
+            to_remove = [
+                key for key, state in self.states.items()
+                if state.model_id == model_id and state.status == "complete"
+            ]
+            for key in to_remove:
+                del self.states[key]
 
-        self._save_state()
+            self._save_state()
 
     def get_progress(self) -> TransferProgress:
         """Get current transfer progress.
