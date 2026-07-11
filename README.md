@@ -2,6 +2,8 @@
 
 Stream Hugging Face model downloads to Google Drive via rclone, using localhost as a VFS cache layer. Perfect for downloading large models (70GB+) without permanent local storage, with resume capability and aria2c-powered high-speed downloads.
 
+This was made to facilitate backups of heavy models into Google Drive (or any rclone supported service) without bogging down local storage. It works.
+
 ## Features
 
 - **High-speed downloads**: Uses aria2c with multi-connection downloads (16 connections by default)
