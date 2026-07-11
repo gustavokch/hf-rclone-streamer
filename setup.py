@@ -14,6 +14,11 @@ import subprocess
 from pathlib import Path
 from typing import Optional, List
 
+try:
+    from .rclone_client import get_rclone_binary
+except ImportError:
+    from rclone_client import get_rclone_binary
+
 
 class SetupError(Exception):
     """Exception raised during setup."""
@@ -22,6 +27,28 @@ class SetupError(Exception):
 
 class RcloneSetup:
     """Helper for setting up rclone with Google Drive."""
+
+    # Mount flags tuned for this streamer's workload: upload-only streaming to
+    # Google Drive with minimal local disk and maximum upload throughput.
+    #   - vfs-cache-mode writes: upload-only, so reads aren't cached (less disk
+    #     than 'full'); files opened for write are still staged then uploaded.
+    #   - vfs-cache-max-size/max-age/poll-interval: evict the staging copy ASAP
+    #     after each upload, so peak disk stays near 1x the active file.
+    #   - drive-chunk-size 64M: fewer HTTP round-trips to GDrive -> throughput.
+    #   - noappledouble/noapplexattr: skip macOS metadata churn on the mount.
+    OPTIMIZED_MOUNT_FLAGS = [
+        "--vfs-cache-mode", "writes",
+        "--vfs-cache-max-size", "10G",
+        "--vfs-cache-max-age", "1h",
+        "--vfs-cache-poll-interval", "1m",
+        "--drive-chunk-size", "64M",
+        "--buffer-size", "32M",
+        "--low-level-retries", "10",
+        "--dir-cache-time", "1h",
+        "--attr-timeout", "1h",
+        "--noappledouble",
+        "--noapplexattr",
+    ]
 
     def __init__(self):
         """Initialize the setup helper."""
@@ -182,35 +209,45 @@ sudo dnf install aria2
             mount_path.mkdir(parents=True, exist_ok=True)
             print(f"Created mount point: {mount_path}")
 
+    def _mount_base_cmd(
+        self,
+        remote: str,
+        mount_path: Path,
+        vfs_cache: bool = True,
+    ) -> List[str]:
+        """Build the foreground rclone mount command (no --daemon)."""
+        cmd = [
+            get_rclone_binary(),
+            "mount",
+            f"{remote}:",
+            str(mount_path),
+        ]
+        if vfs_cache:
+            cmd.extend(self.OPTIMIZED_MOUNT_FLAGS)
+        return cmd
+
     def get_mount_command(
         self,
         remote: str,
         mount_path: Path,
         vfs_cache: bool = True,
     ) -> List[str]:
-        """Get the rclone mount command.
+        """Get the rclone mount command (daemonized, with logging).
 
         Args:
             remote: Remote name.
             mount_path: Mount point path.
-            vfs_cache: Whether to use VFS cache mode.
+            vfs_cache: Whether to use the optimized VFS cache flags.
 
         Returns:
             Command as list of strings.
         """
-        cmd = [
-            "rclone",
-            "mount",
-            f"{remote}:",
-            str(mount_path),
+        cmd = self._mount_base_cmd(remote, mount_path, vfs_cache=vfs_cache)
+        cmd.extend([
             "--daemon",  # Run in background
-            "--log-file",
-            str(mount_path.parent / "rclone.log"),
-        ]
-
-        if vfs_cache:
-            cmd.extend(["--vfs-cache-mode", "full"])
-
+            "--log-file", str(mount_path.parent / "rclone.log"),
+            "--log-level", "INFO",
+        ])
         return cmd
 
     def print_mount_command(
@@ -224,28 +261,25 @@ sudo dnf install aria2
         Args:
             remote: Remote name.
             mount_path: Mount point path.
-            vfs_cache: Whether to use VFS cache mode.
+            vfs_cache: Whether to use the optimized VFS cache flags.
         """
-        cmd_parts = [
-            "rclone",
-            "mount",
-            f"{remote}:",
-            str(mount_path),
+        fg_cmd = self._mount_base_cmd(remote, mount_path, vfs_cache=vfs_cache)
+        daemon_cmd = fg_cmd + [
+            "--daemon",
+            "--log-file", str(mount_path.parent / "rclone.log"),
+            "--log-level", "INFO",
         ]
 
-        if vfs_cache:
-            cmd_parts.extend(["--vfs-cache-mode", "full"])
-
         print("\n" + "="*60)
-        print("Mount Command")
+        print("Mount Command (optimized for min disk / max throughput)")
         print("="*60)
-        print("\nTo mount your Google Drive, run:")
+        print("\nTo mount your Google Drive in the foreground, run:")
         print()
-        print(f"  {' '.join(cmd_parts)}")
+        print(f"  {' '.join(fg_cmd)}")
         print()
-        print("\nOr run in background with logging:")
+        print("\nOr run in the background with logging:")
         print()
-        print(f"  {' '.join(cmd_parts + ['--daemon', '--log-file', str(mount_path.parent / 'rclone.log')])}")
+        print(f"  {' '.join(daemon_cmd)}")
         print()
         print("="*60)
 
@@ -255,30 +289,23 @@ sudo dnf install aria2
         mount_path: Path,
         vfs_cache: bool = True,
     ) -> bool:
-        """Attempt to mount Google Drive now.
+        """Attempt to mount Google Drive now (foreground).
 
         Args:
             remote: Remote name.
             mount_path: Mount point path.
-            vfs_cache: Whether to use VFS cache mode.
+            vfs_cache: Whether to use the optimized VFS cache flags.
 
         Returns:
             True if mount successful, False otherwise.
         """
         mount_path = Path(mount_path).expanduser().resolve()
 
-        # Create mount command (without --daemon so we can see errors)
-        cmd = [
-            "rclone",
-            "mount",
-            f"{remote}:",
-            str(mount_path),
-        ]
-
-        if vfs_cache:
-            cmd.extend(["--vfs-cache-mode", "full"])
+        # Foreground (no --daemon) so errors are visible.
+        cmd = self._mount_base_cmd(remote, mount_path, vfs_cache=vfs_cache)
 
         print(f"\nAttempting to mount {remote}: to {mount_path}...")
+        print(f"Binary: {get_rclone_binary()}")
         print("Note: This command may require sudo privileges on some systems.")
         print("Press Ctrl+C to stop the mount (or close this terminal).\n")
 

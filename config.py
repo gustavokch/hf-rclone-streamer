@@ -29,6 +29,16 @@ class Config:
         "timeout": 300,  # Timeout for operations in seconds
         "use_aria2c": True,  # Use aria2c for downloads (default: True)
         "aria2c_connections": 16,  # Number of connections per file for aria2c
+        "pipeline": True,  # Overlap upload of shard x with download of x+1 (depth-1)
+        # --- rclone binary / upload strategy ---
+        "rclone_binary": "rclone-fuse",  # FUSE-enabled rclone binary to invoke
+        "no_mount": False,  # Bypass FUSE mount; upload via `rclone copyto` directly
+        "remote": None,  # Remote name for no-mount/config mode (auto-detected if None)
+        "drive_chunk_size": "64M",  # GDrive upload chunk size (throughput lever)
+        # --- mount VFS cache (used by `setup` mount command) ---
+        "vfs_cache_mode": "writes",  # writes = upload-only, less disk than 'full'
+        "vfs_cache_max_size": "10G",  # Cap idle VFS cache (active file is exempt)
+        "vfs_cache_max_age": "1h",  # Evict staging copy soon after upload
     }
 
     # Environment variable mappings
@@ -44,6 +54,11 @@ class Config:
         "retry_delay": "RETRY_DELAY",
         "hf_token": "HF_TOKEN",
         "timeout": "TIMEOUT",
+        "rclone_binary": "RCLONE_BINARY",
+        "no_mount": "NO_MOUNT",
+        "remote": "REMOTE",
+        "drive_chunk_size": "DRIVE_CHUNK_SIZE",
+        "pipeline": "PIPELINE",
     }
 
     def __init__(self, config_file: Optional[Path] = None):
@@ -109,7 +124,7 @@ class Config:
             Parsed value.
         """
         # Boolean values
-        if key in ("cleanup", "resume"):
+        if key in ("cleanup", "resume", "no_mount", "pipeline"):
             return value.lower() in ("1", "true", "yes", "on")
 
         # Integer values
@@ -244,6 +259,46 @@ class Config:
     def aria2c_connections(self) -> int:
         """Get number of aria2c connections per file."""
         return self.get("aria2c_connections", 16)
+
+    @property
+    def pipeline(self) -> bool:
+        """Whether to overlap upload of shard x with download of shard x+1."""
+        return self.get("pipeline", True)
+
+    @property
+    def rclone_binary(self) -> str:
+        """Get the rclone binary to invoke (default: rclone-fuse)."""
+        return self.get("rclone_binary", "rclone-fuse")
+
+    @property
+    def no_mount(self) -> bool:
+        """Whether to bypass the FUSE mount and upload via `rclone copyto`."""
+        return self.get("no_mount", False)
+
+    @property
+    def remote(self) -> Optional[str]:
+        """Get the remote name for no-mount/config mode."""
+        return self.get("remote")
+
+    @property
+    def drive_chunk_size(self) -> str:
+        """Get the GDrive upload chunk size (e.g. '64M')."""
+        return self.get("drive_chunk_size", "64M")
+
+    @property
+    def vfs_cache_mode(self) -> str:
+        """Get the VFS cache mode for the mount (default: writes)."""
+        return self.get("vfs_cache_mode", "writes")
+
+    @property
+    def vfs_cache_max_size(self) -> str:
+        """Get the VFS cache size cap (default: 10G)."""
+        return self.get("vfs_cache_max_size", "10G")
+
+    @property
+    def vfs_cache_max_age(self) -> str:
+        """Get the VFS cache max age (default: 1h)."""
+        return self.get("vfs_cache_max_age", "1h")
 
     def ensure_cache_dir(self) -> Path:
         """Ensure cache directory exists and return its path.

@@ -20,14 +20,26 @@ try:
     from .config import Config, get_config
     from .hf_api import search_models, get_model_info, format_size, print_model_summary
     from .transfer_manager import TransferManager, TransferProgress
-    from .rclone_client import detect_mode, get_free_space, format_size as rclone_format_size
+    from .rclone_client import (
+        detect_mode,
+        get_free_space,
+        resolve_remote,
+        set_rclone_binary,
+        format_size as rclone_format_size,
+    )
     from .setup import run_setup, quick_check
 except ImportError:
     # Running directly (not as a module)
     from config import Config, get_config
     from hf_api import search_models, get_model_info, format_size, print_model_summary
     from transfer_manager import TransferManager, TransferProgress
-    from rclone_client import detect_mode, get_free_space, format_size as rclone_format_size
+    from rclone_client import (
+        detect_mode,
+        get_free_space,
+        resolve_remote,
+        set_rclone_binary,
+        format_size as rclone_format_size,
+    )
     from setup import run_setup, quick_check
 
 
@@ -119,6 +131,30 @@ Examples:
         help="Number of connections per file for aria2c (default: 16)",
     )
 
+    # rclone binary / upload strategy
+    parser.add_argument(
+        "--rclone-binary",
+        type=str,
+        help="rclone binary to invoke (default: rclone-fuse)",
+    )
+    parser.add_argument(
+        "--no-mount",
+        action="store_true",
+        help="Bypass the FUSE mount and upload directly via `rclone copyto` "
+        "(halves peak disk usage; no mount point needed)",
+    )
+    parser.add_argument(
+        "--remote",
+        type=str,
+        help="rclone remote name for no-mount/config mode (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--drive-chunk-size",
+        type=str,
+        default="64M",
+        help="GDrive upload chunk size, e.g. 64M or 128M (default: 64M)",
+    )
+
     # Subcommands
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -205,6 +241,17 @@ Examples:
         help="Quick check of setup status without interaction",
     )
 
+    # Setup-FUSE command (macOS FUSE support)
+    setup_fuse_parser = subparsers.add_parser(
+        "setup-fuse",
+        help="Build rclone with FUSE mount support for macOS",
+    )
+    setup_fuse_parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Only check FUSE support status",
+    )
+
     return parser
 
 
@@ -226,10 +273,17 @@ def cmd_download(args: argparse.Namespace, config: Config) -> int:
 
     # Verify rclone setup
     try:
-        mode = detect_mode(config.rclone_path)
-        print(f"Rclone mode: {mode.mode}")
-        if mode.mode == "mount":
-            print(f"Mount path: {mode.path}")
+        if config.no_mount:
+            remote = resolve_remote(config.rclone_path, config.remote)
+            print(f"Rclone mode: direct copy (no mount)")
+            print(f"Binary: {config.rclone_binary}")
+            print(f"Remote: {remote}:")
+            print(f"Upload chunk: {config.drive_chunk_size}")
+        else:
+            mode = detect_mode(config.rclone_path)
+            print(f"Rclone mode: {mode.mode}")
+            if mode.mode == "mount":
+                print(f"Mount path: {mode.path}")
     except Exception as e:
         print(f"Error: {e}")
         return 1
@@ -472,6 +526,52 @@ def cmd_status(args: argparse.Namespace, config: Config) -> int:
     return 0
 
 
+def cmd_setup_fuse(args: argparse.Namespace, config: Config) -> int:
+    """Handle the setup-fuse command for building rclone with FUSE support.
+
+    Args:
+        args: Parsed arguments.
+        config: Configuration object.
+
+    Returns:
+        Exit code.
+    """
+    from rclone_fuse_builder import RcloneFUSEBuilder
+
+    builder = RcloneFUSEBuilder()
+
+    if args.check_only:
+        # Just check status
+        print("\n" + "="*60)
+        print("rclone FUSE Support Check")
+        print("="*60)
+
+        if builder.is_macos():
+            supports_mount, msg = builder.check_rclone_mount_support()
+            print(f"\nPlatform: macOS")
+            print(f"rclone mount support: {'✓ Yes' if supports_mount else '✗ No'}")
+            if not supports_mount:
+                print(f"  Reason: {msg}")
+            print(f"macFUSE installed: {'✓ Yes' if builder.check_fuse_installed() else '✗ No'}")
+            print(f"Homebrew rclone: {'✓ Yes' if builder.check_homebrew_rclone() else '✗ No'}")
+
+            if builder.check_homebrew_rclone():
+                print(f"\n⚠️  Homebrew rclone detected!")
+                print(f"This version does NOT support FUSE mounting on macOS.")
+                print(f"\nRun 'python run.py setup-fuse' to build a FUSE-enabled version.")
+            elif not supports_mount:
+                print(f"\nRun 'python run.py setup-fuse' to set up FUSE support.")
+        else:
+            print(f"\nPlatform: {builder.os_name}")
+            print("FUSE setup is only needed for macOS.")
+        print("\n" + "="*60)
+        return 0
+
+    # Run interactive setup
+    success = builder.setup_fuse_rclone()
+    return 0 if success else 1
+
+
 def cmd_setup(args: argparse.Namespace, config: Config) -> int:
     """Handle the setup command.
 
@@ -544,6 +644,17 @@ def main() -> int:
         config.set("use_aria2c", False)
     if args.aria2c_connections:
         config.set("aria2c_connections", args.aria2c_connections)
+    if args.no_mount:
+        config.set("no_mount", True)
+    if args.remote:
+        config.set("remote", args.remote)
+    if args.rclone_binary:
+        config.set("rclone_binary", args.rclone_binary)
+    if args.drive_chunk_size:
+        config.set("drive_chunk_size", args.drive_chunk_size)
+
+    # Point rclone_client at the configured binary
+    set_rclone_binary(config.rclone_binary)
 
     # Dispatch to command handler
     command_handlers = {
@@ -553,6 +664,7 @@ def main() -> int:
         "info": cmd_info,
         "status": cmd_status,
         "setup": cmd_setup,
+        "setup-fuse": cmd_setup_fuse,
     }
 
     handler = command_handlers.get(args.command)

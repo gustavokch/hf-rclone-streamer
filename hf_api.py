@@ -18,6 +18,12 @@ import urllib.parse
 
 
 try:
+    from .cancel import CancelToken, NO_CANCEL, terminate
+except ImportError:
+    from cancel import CancelToken, NO_CANCEL, terminate
+
+
+try:
     from huggingface_hub import (
         hf_hub_download,
         list_repo_files,
@@ -175,6 +181,7 @@ class Aria2cDownloader:
         output_path: Path,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         headers: Optional[Dict[str, str]] = None,
+        cancel=NO_CANCEL,
     ) -> Path:
         """Download a file using aria2c.
 
@@ -183,6 +190,7 @@ class Aria2cDownloader:
             output_path: Path to save the file.
             progress_callback: Optional callback(downloaded_bytes, total_bytes).
             headers: Optional HTTP headers.
+            cancel: Optional CancelToken to terminate aria2c promptly on Ctrl-C.
 
         Returns:
             Path to downloaded file.
@@ -224,7 +232,7 @@ class Aria2cDownloader:
                 # If progress callback is provided, we'll monitor progress
                 if progress_callback:
                     return self._download_with_progress(
-                        cmd, url, output_path, progress_callback
+                        cmd, url, output_path, progress_callback, cancel
                     )
                 else:
                     # Simple download without progress monitoring
@@ -238,6 +246,8 @@ class Aria2cDownloader:
 
             except subprocess.CalledProcessError as e:
                 last_error = e
+                if cancel.is_set():
+                    raise FileDownloadError(f"download cancelled: {url}")
                 if attempt < self.max_retries - 1:
                     time.sleep(self.retry_delay)
                     continue
@@ -247,6 +257,8 @@ class Aria2cDownloader:
                 )
             except Exception as e:
                 last_error = e
+                if cancel.is_set():
+                    raise FileDownloadError(f"download cancelled: {url}")
                 if attempt < self.max_retries - 1:
                     time.sleep(self.retry_delay)
                     continue
@@ -263,6 +275,7 @@ class Aria2cDownloader:
         url: str,
         output_path: Path,
         progress_callback: Callable[[int, int], None],
+        cancel=NO_CANCEL,
     ) -> Path:
         """Download with progress monitoring.
 
@@ -271,6 +284,7 @@ class Aria2cDownloader:
             url: Download URL.
             output_path: Output file path.
             progress_callback: Progress callback.
+            cancel: Optional CancelToken to terminate aria2c on Ctrl-C.
 
         Returns:
             Path to downloaded file.
@@ -278,13 +292,15 @@ class Aria2cDownloader:
         # Add progress parameters
         cmd.extend(["--summary-interval=1", "--show-console-readout=true"])
 
-        # Start aria2c process
-        process = subprocess.Popen(
+        # Start aria2c in its own session so cancellation is deterministic:
+        # terminal Ctrl-C won't reach it (we terminate it via the CancelToken).
+        process = cancel.register(subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-        )
+            start_new_session=True,
+        ))
 
         # Parse progress from output
         size_pattern = re.compile(r"([\d.]+)([KMGT]?iB)")
@@ -292,26 +308,37 @@ class Aria2cDownloader:
         total_size = 0
         last_downloaded = 0
 
-        for line in process.stdout:
-            # aria2c outputs progress like:
-            # [# SIZE  MiB/s  ETA]
-            # Download: 1.0GiB/10.0GiB (10%)
-            # Or uses a progress bar
+        try:
+            for line in process.stdout:
+                if cancel.is_set():
+                    break
+                # aria2c outputs progress like:
+                # [# SIZE  MiB/s  ETA]
+                # Download: 1.0GiB/10.0GiB (10%)
+                # Or uses a progress bar
 
-            # Try to extract progress information
-            if "/" in line:
-                # Look for patterns like "1.0GiB/10.0GiB"
-                match = re.search(r"([\d.]+[KMGT]?iB)/([\d.]+[KMGT]?iB)", line)
-                if match:
-                    downloaded_str, total_str = match.groups()
-                    downloaded = self._parse_size(downloaded_str)
-                    total = self._parse_size(total_str)
+                # Try to extract progress information
+                if "/" in line:
+                    # aria2c emits lines like:
+                    #   [#e859b4 1.2GiB/5.0GiB(24%) CN:16 DL:52MiB ETA:1m15s]
+                    # The unit may be "B" (at 0%) or "KiB"/"MiB"/"GiB"/"TiB".
+                    match = re.search(r"([\d.]+[KMGT]?i?B)/([\d.]+[KMGT]?i?B)", line)
+                    if match:
+                        downloaded_str, total_str = match.groups()
+                        downloaded = self._parse_size(downloaded_str)
+                        total = self._parse_size(total_str)
 
-                    if total > 0:
-                        total_size = total
-                        progress_callback(downloaded, total_size)
+                        if total > 0:
+                            total_size = total
+                            progress_callback(downloaded, total_size)
 
-        return_code = process.wait()
+            return_code = process.wait()
+        finally:
+            cancel.unregister(process)
+            # On unwind with aria2c still alive (e.g. Ctrl-C interrupted the
+            # read mid-transfer), kill it so it can't outlive this call.
+            if process.poll() is None:
+                terminate(process)
 
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, cmd)
@@ -535,6 +562,7 @@ def download_file(
     retry_delay: int = 5,
     use_aria2c: bool = True,
     connections: int = 16,
+    cancel=NO_CANCEL,
 ) -> Path:
     """Download a file from Hugging Face Hub.
 
@@ -549,6 +577,7 @@ def download_file(
         retry_delay: Seconds between retries.
         use_aria2c: Use aria2c for download (default: True).
         connections: Number of connections for aria2c (default: 16).
+        cancel: Optional CancelToken to terminate the download on Ctrl-C.
 
     Returns:
         Path to the downloaded file.
@@ -567,7 +596,7 @@ def download_file(
                 max_retries=max_retries,
                 retry_delay=retry_delay,
             )
-            return downloader.download(url, local_path, progress_callback)
+            return downloader.download(url, local_path, progress_callback, cancel=cancel)
         except Exception as e:
             print(f"aria2c download failed, falling back to huggingface_hub: {e}")
             # Fall through to huggingface_hub download
