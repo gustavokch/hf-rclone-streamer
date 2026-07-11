@@ -1,0 +1,23 @@
+# HF to GDrive Streamer - Requirements
+#
+# Core dependencies for streaming Hugging Face models to Google Drive via rclone.
+
+# Hugging Face Hub API
+huggingface-hub>=0.25.0
+
+# Rich terminal output with progress bars
+rich>=13.7.0
+
+# Optional: for enhanced progress bars
+tqdm>=4.66.0
+
+# Note: aria2c is required for high-speed downloads but must be installed separately:
+# - macOS: brew install aria2
+# - Linux: apt install aria2  (Ubuntu/Debian)
+# - Linux: dnf install aria2  (Fedora)
+# It's not available via pip and should be installed via system package manager.
+#
+# Note: rclone is required for Google Drive operations but must be installed separately:
+# - macOS: brew install rclone
+# - Linux: apt install rclone  (Ubuntu/Debian)
+# - Or download from: https://rclone.org/downloads/
