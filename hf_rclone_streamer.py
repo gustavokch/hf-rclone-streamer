@@ -15,6 +15,7 @@ from .config import Config, get_config
 from .hf_api import search_models, get_model_info, format_size, print_model_summary
 from .transfer_manager import TransferManager, TransferProgress
 from .rclone_client import detect_mode, get_free_space, format_size as rclone_format_size
+from .setup import run_setup, quick_check
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -178,6 +179,17 @@ Examples:
     status_parser = subparsers.add_parser(
         "status",
         help="Show transfer status",
+    )
+
+    # Setup command
+    setup_parser = subparsers.add_parser(
+        "setup",
+        help="Set up rclone and Google Drive for first-time users",
+    )
+    setup_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Quick check of setup status without interaction",
     )
 
     return parser
@@ -447,6 +459,43 @@ def cmd_status(args: argparse.Namespace, config: Config) -> int:
     return 0
 
 
+def cmd_setup(args: argparse.Namespace, config: Config) -> int:
+    """Handle the setup command.
+
+    Args:
+        args: Parsed arguments.
+        config: Configuration object.
+
+    Returns:
+        Exit code.
+    """
+    if args.check:
+        # Quick check mode
+        status = quick_check()
+
+        print("\n" + "="*60)
+        print("Setup Status Check")
+        print("="*60)
+        print(f"\nrclone: {'✓ Available' if status['rclone_available'] else '✗ Not installed'}")
+        print(f"aria2c: {'✓ Available' if status['aria2c_available'] else '✗ Not installed'}")
+
+        if status["rclone_available"]:
+            if status["remotes"]:
+                print(f"\nConfigured remotes ({len(status['remotes'])}):")
+                for remote in status["remotes"]:
+                    print(f"  - {remote}")
+                print(f"\nGoogle Drive: {'✓ Configured' if status['has_gdrive'] else '✗ Not found'}")
+            else:
+                print("\nNo rclone remotes configured.")
+                print("Run 'python -m hf_rclone_streamer setup' to configure.")
+
+        print("\n" + "="*60)
+        return 0
+
+    # Interactive setup mode
+    return run_setup()
+
+
 def main() -> int:
     """Main entry point.
 
@@ -490,6 +539,7 @@ def main() -> int:
         "batch": cmd_batch,
         "info": cmd_info,
         "status": cmd_status,
+        "setup": cmd_setup,
     }
 
     handler = command_handlers.get(args.command)
