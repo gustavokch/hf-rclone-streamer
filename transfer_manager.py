@@ -211,17 +211,21 @@ class TransferManager:
     def _notify_progress(self) -> None:
         """Sample the rate estimators and notify the progress callback.
 
-        Always samples (even with no callback) so ``get_progress``/``print_status``
-        report live rates during a callback-less transfer; the callback itself is
-        conditional. Runs under ``_state_lock`` (held by ``_update_state``); the
-        estimators add their own locks in a one-way order, so no deadlock.
+        Sampling is unconditional (even with no callback) so ``get_progress`` /
+        ``print_status`` can report live rates during a callback-less transfer —
+        the estimators must see the bytes. The rate/ETA populate and the
+        callback itself are conditional on a callback being set, since the
+        populated ``progress`` is otherwise a discarded local (and
+        ``get_progress`` re-runs ``_populate_rates`` itself). Runs under
+        ``_state_lock`` (held by ``_update_state``); the estimators add their own
+        locks in a one-way order, so no deadlock.
         """
         progress = self._calculate_progress()
         now = time.time()
         self._download_estimator.sample(now, progress.downloaded_bytes)
         self._upload_estimator.sample(now, progress.uploaded_bytes)
-        self._populate_rates(progress)
         if self.progress_callback:
+            self._populate_rates(progress)
             self.progress_callback(progress)
 
     def _populate_rates(self, progress: TransferProgress) -> None:
@@ -240,10 +244,13 @@ class TransferManager:
         The transfer is "complete" when all bytes are on GDrive, so the upload
         rate is the honest basis. With the depth-1 pipeline, when download is
         the bottleneck ``uploaded_bytes`` still advances at ~the download rate
-        (one shard lagged), so this stays sane in both bottleneck cases. While
-        the first shard is still downloading (no upload sample yet), fall back
-        to the download rate over total remaining bytes as a provisional bound
-        — avoiding minutes of "calculating…" on a large first shard.
+        (one shard lagged), so this stays sane in both bottleneck cases. The
+        download-based fallback fires only while no upload rate exists yet
+        (``blended_rate()`` is ``None`` — i.e. the first shard still
+        downloading), avoiding minutes of "calculating…" on a large first
+        shard; an upload *stall* (samples present but rate ``0``) yields
+        ``None`` (displayed as `calculating…`), not a download-based ETA that
+        would tick down while the upload is stuck.
         """
         remaining_upload = progress.total_bytes - progress.uploaded_bytes
         if remaining_upload <= 0:
@@ -251,39 +258,51 @@ class TransferManager:
         upload_eta = self._upload_estimator.eta(remaining_upload)
         if upload_eta is not None:
             return upload_eta
-        # Warmup: first shard still downloading, no upload sample yet.
-        remaining_total = progress.total_bytes - progress.downloaded_bytes
-        if remaining_total > 0:
-            return self._download_estimator.eta(remaining_total)
+        # Warmup only: no upload rate yet (first shard still downloading). A
+        # genuine *stall* (upload has samples but blended_rate() == 0.0) must
+        # NOT fall through to a download-based ETA — that would tick down while
+        # the upload (the completion gate) is stuck. Let it read "calculating…".
+        if self._upload_estimator.blended_rate() is None:
+            remaining_total = progress.total_bytes - progress.downloaded_bytes
+            if remaining_total > 0:
+                return self._download_estimator.eta(remaining_total)
         return None
 
     def _calculate_progress(self) -> TransferProgress:
         """Calculate overall transfer progress.
 
+        Takes ``_state_lock`` so the five passes over ``self.states.values()``
+        see a consistent snapshot — a concurrent size-changing write (a new key
+        in ``transfer_model`` or ``clear_state``) would otherwise raise
+        ``RuntimeError`` mid-iteration. Re-entrant: ``_update_state`` /
+        ``_notify_progress`` already hold the lock, ``get_progress`` takes it
+        fresh.
+
         Returns:
             TransferProgress object.
         """
-        total_files = len(self.states)
-        completed_files = sum(
-            1 for s in self.states.values()
-            if s.status == "complete"
-        )
-        failed_files = sum(
-            1 for s in self.states.values()
-            if s.status == "failed"
-        )
-        total_bytes = sum(s.total_bytes for s in self.states.values())
-        downloaded_bytes = sum(s.downloaded_bytes for s in self.states.values())
-        uploaded_bytes = sum(s.uploaded_bytes for s in self.states.values())
+        with self._state_lock:
+            total_files = len(self.states)
+            completed_files = sum(
+                1 for s in self.states.values()
+                if s.status == "complete"
+            )
+            failed_files = sum(
+                1 for s in self.states.values()
+                if s.status == "failed"
+            )
+            total_bytes = sum(s.total_bytes for s in self.states.values())
+            downloaded_bytes = sum(s.downloaded_bytes for s in self.states.values())
+            uploaded_bytes = sum(s.uploaded_bytes for s in self.states.values())
 
-        return TransferProgress(
-            total_files=total_files,
-            completed_files=completed_files,
-            total_bytes=total_bytes,
-            downloaded_bytes=downloaded_bytes,
-            uploaded_bytes=uploaded_bytes,
-            failed_files=failed_files,
-        )
+            return TransferProgress(
+                total_files=total_files,
+                completed_files=completed_files,
+                total_bytes=total_bytes,
+                downloaded_bytes=downloaded_bytes,
+                uploaded_bytes=uploaded_bytes,
+                failed_files=failed_files,
+            )
 
     def transfer_model(
         self,
@@ -342,21 +361,23 @@ class TransferManager:
         except Exception as e:
             print(f"Could not check available space: {e}")
 
-        # Initialize states for all files
-        for file in model_info.files:
-            key = self._get_state_key(model_id, file.path)
-            if key not in self.states:
-                self.states[key] = TransferState(
-                    model_id=model_id,
-                    filename=file.path,
-                    status="pending",
-                    total_bytes=file.size,
-                )
-            else:
-                # Update total bytes in case it changed
-                self.states[key].total_bytes = file.size
+        # Initialize states for all files. Takes _state_lock: adding keys changes
+        # dict size, which would race _calculate_progress's iteration otherwise.
+        with self._state_lock:
+            for file in model_info.files:
+                key = self._get_state_key(model_id, file.path)
+                if key not in self.states:
+                    self.states[key] = TransferState(
+                        model_id=model_id,
+                        filename=file.path,
+                        status="pending",
+                        total_bytes=file.size,
+                    )
+                else:
+                    # Update total bytes in case it changed
+                    self.states[key].total_bytes = file.size
 
-        self._save_state()
+            self._save_state()
 
         # Fresh cancel token per transfer: setting it (on Ctrl-C, or in the
         # finally below) terminates the in-flight aria2c/rclone subprocess.
@@ -734,8 +755,10 @@ class TransferManager:
         Returns:
             TransferProgress object.
         """
+        # _calculate_progress took _state_lock above; _populate_rates reads
+        # estimator locks only (no _state_lock, no sampling).
         progress = self._calculate_progress()
-        self._populate_rates(progress)  # last-known rates; no sampling, no lock
+        self._populate_rates(progress)
         return progress
 
     def get_failed_transfers(self) -> List[TransferState]:
@@ -751,9 +774,10 @@ class TransferManager:
 
     def clear_state(self) -> None:
         """Clear all transfer state."""
-        self.states.clear()
-        if self.state_file.exists():
-            self.state_file.unlink()
+        with self._state_lock:
+            self.states.clear()
+            if self.state_file.exists():
+                self.state_file.unlink()
 
     def print_status(self) -> None:
         """Print current transfer status."""

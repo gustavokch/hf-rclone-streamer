@@ -170,11 +170,6 @@ class RateEstimator:
             return None
         return remaining_bytes / rate
 
-    def reset(self) -> None:
-        """Drop all samples (e.g. between unrelated transfers)."""
-        with self._lock:
-            self._samples.clear()
-
 
 def format_rate(bytes_per_second: Optional[float]) -> str:
     """Format a byte rate for display.

@@ -22,7 +22,7 @@ from config import Config
 from cancel import NO_CANCEL
 from hf_api import FileInfo
 from rate_estimator import RateEstimator, format_rate, format_eta
-from transfer_manager import TransferManager, TransferState
+from transfer_manager import TransferManager, TransferProgress, TransferState
 
 
 # --------------------------------------------------------------------------- #
@@ -330,6 +330,44 @@ def test_integration_populates_rates():
         assert prog.eta_seconds == 0.0  # uploaded_bytes == total_bytes -> done
 
 
+# --------------------------------------------------------------------------- #
+# ETA stall fallback (TransferManager._compute_eta) + throttle skew
+# --------------------------------------------------------------------------- #
+def test_eta_stall_does_not_fall_back_to_download():
+    # Upload stalled (>=2 equal samples -> blended_rate() == 0.0) while download
+    # is still advancing must NOT produce a download-based ETA. Pre-seed the
+    # estimators directly and call _compute_eta with a hand-built progress so the
+    # stall is exact and clock-free. (Without Fix 1 this returns 7.0 — 700
+    # remaining bytes / 100 B/s download — instead of None.)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _make_manager(tmpdir)
+        # Upload stalled: constant from the FIRST sample so the estimator never
+        # sees a 0->N jump (a jump reads as progress, not a stall).
+        for t in range(4):
+            mgr._upload_estimator.sample(float(t), 500)
+        # Download advancing: a positive rate cached in the download estimator.
+        for t in range(4):
+            mgr._download_estimator.sample(float(t), t * 100)
+        prog = TransferProgress(
+            total_files=1, completed_files=0, total_bytes=1000,
+            downloaded_bytes=300, uploaded_bytes=500, failed_files=0,
+        )
+        assert mgr._compute_eta(prog) is None
+
+
+def test_current_rate_approx_under_throttled_sampling():
+    # Sub-throttle cadence: the in-place byte update attributes fresh bytes to an
+    # older timestamp, but the constant offset cancels across the 5s window, so
+    # current_rate() stays within tolerance of the true 100 B/s.
+    est = RateEstimator(min_sample_interval=0.25, current_window_seconds=5.0)
+    for i in range(61):  # 0.0 .. 6.0s, steady 100 B/s
+        t = i * 0.1
+        est.sample(t, int(t * 100))
+    rate = est.current_rate()
+    assert rate is not None
+    assert 85.0 <= rate <= 115.0
+
+
 def main():
     tests = [
         test_warmup_returns_none,
@@ -353,6 +391,8 @@ def main():
         test_format_eta_edges,
         test_thread_safety_smoke,
         test_integration_populates_rates,
+        test_eta_stall_does_not_fall_back_to_download,
+        test_current_rate_approx_under_throttled_sampling,
     ]
     for fn in tests:
         fn()
