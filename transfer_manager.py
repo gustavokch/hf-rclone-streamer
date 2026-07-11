@@ -557,82 +557,71 @@ class TransferManager:
                     print(f"Failed to transfer {self.states[key].filename} after retries")
             return None, ok
 
-        try:
-            # The `with` block guarantees the worker is fully shut down before
-            # this method returns, so _cleanup_cache (back in transfer_model)
-            # can't unlink a file the worker is still reading.
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                # Inner handler: a Ctrl-C during the loop must set the cancel
-                # token BEFORE the `with` exits (which calls shutdown(wait=True)
-                # on the worker). Setting it SIGTERMs the in-flight subprocess so
-                # the worker finishes promptly instead of blocking shutdown for
-                # the rest of the transfer.
-                try:
-                    for file in files:
-                        key = self._get_state_key(model_id, file.path)
-                        state = self.states[key]
+        # The `with` block guarantees the worker is fully shut down before this
+        # method returns, so _cleanup_cache (back in transfer_model) can't
+        # unlink a file the worker is still reading.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            # Inner handler: a Ctrl-C during the loop must set the cancel token
+            # BEFORE the `with` exits (which calls shutdown(wait=True) on the
+            # worker). Setting it SIGTERMs the in-flight subprocess so the
+            # worker finishes promptly instead of blocking shutdown for the rest
+            # of the transfer. State checkpointing on cancel is owned by
+            # transfer_model, which wraps both the pipelined and sequential paths.
+            try:
+                for file in files:
+                    key = self._get_state_key(model_id, file.path)
+                    state = self.states[key]
 
-                        # Skip files already complete under resume. The pending
-                        # upload still must be drained first so its result counts.
-                        if state.status == "complete" and self.config.resume:
-                            pending_upload, ok = _drain(pending_upload)
-                            if not ok:
-                                success = False
-                            if state.cache_path and Path(state.cache_path).exists():
-                                try:
-                                    Path(state.cache_path).unlink()
-                                except FileNotFoundError:
-                                    pass
-                            print(f"Skipping {file.path} (already transferred)")
-                            continue
-
-                        # Download on the main thread (blocks). The previous
-                        # shard's upload (if any) runs concurrently on the
-                        # worker — this is the overlap: upload(x) ∥ download(x+1).
-                        cache_path = self._download_file(
-                            model_id, file, cancel=cancel
-                        )
-                        if cache_path is None:
-                            # Download failed; state already recorded. Drain
-                            # the pending upload before moving on so its result
-                            # isn't lost (un-resulted futures swallow their
-                            # exceptions).
-                            success = False
-                            pending_upload, _ = _drain(pending_upload)
-                            if not self._retry_or_fail(key):
-                                print(f"Failed to transfer {file.path} after retries")
-                            continue
-
-                        # Submit this shard's upload to the worker, THEN join
-                        # the previous upload. Order matters: submit before
-                        # drain keeps the next iteration's download from
-                        # stalling on the join.
-                        this_upload = executor.submit(
-                            self._upload_file, model_id, file, cache_path,
-                            dest_dir, cancel,
-                        )
+                    # Skip files already complete under resume. The pending
+                    # upload still must be drained first so its result counts.
+                    if state.status == "complete" and self.config.resume:
                         pending_upload, ok = _drain(pending_upload)
                         if not ok:
                             success = False
-                        pending_upload = (key, this_upload)
+                        if state.cache_path and Path(state.cache_path).exists():
+                            try:
+                                Path(state.cache_path).unlink()
+                            except FileNotFoundError:
+                                pass
+                        print(f"Skipping {file.path} (already transferred)")
+                        continue
 
-                    # Drain the final shard's upload.
+                    # Download on the main thread (blocks). The previous shard's
+                    # upload (if any) runs concurrently on the worker — this is
+                    # the overlap: upload(x) ∥ download(x+1).
+                    cache_path = self._download_file(
+                        model_id, file, cancel=cancel
+                    )
+                    if cache_path is None:
+                        # Download failed; state already recorded. Drain the
+                        # pending upload before moving on so its result isn't
+                        # lost (un-resulted futures swallow their exceptions).
+                        success = False
+                        pending_upload, _ = _drain(pending_upload)
+                        if not self._retry_or_fail(key):
+                            print(f"Failed to transfer {file.path} after retries")
+                        continue
+
+                    # Submit this shard's upload to the worker, THEN join the
+                    # previous upload. Order matters: submit before drain keeps
+                    # the next iteration's download from stalling on the join.
+                    this_upload = executor.submit(
+                        self._upload_file, model_id, file, cache_path,
+                        dest_dir, cancel,
+                    )
                     pending_upload, ok = _drain(pending_upload)
                     if not ok:
                         success = False
-                except KeyboardInterrupt:
-                    # Fires before the `with` exits → before shutdown(wait=True).
-                    cancel.set()
-                    raise
+                    pending_upload = (key, this_upload)
 
-        except KeyboardInterrupt:
-            # Save state so a resume run can pick up. The in-flight subprocess
-            # was already terminated by the inner handler's cancel.set() above,
-            # so the executor's shutdown has already completed by the time we
-            # arrive; this block just persists the checkpoint.
-            with self._state_lock:
-                self._save_state()
-            raise
+                # Drain the final shard's upload.
+                pending_upload, ok = _drain(pending_upload)
+                if not ok:
+                    success = False
+            except KeyboardInterrupt:
+                # Fires before the `with` exits → before shutdown(wait=True).
+                cancel.set()
+                raise
 
         return success
 

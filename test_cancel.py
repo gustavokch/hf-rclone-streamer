@@ -135,6 +135,7 @@ def test_transfer_model_cancel_saves_state_and_raises():
 
         mgr._download_file = dl
         mgr._upload_file = ul
+        orig_get_model_info, orig_get_free_space = tm.get_model_info, tm.get_free_space
         tm.get_model_info = lambda **kw: ModelInfo(
             model_id=kw["model_id"], files=files, total_size=300
         )
@@ -142,9 +143,12 @@ def test_transfer_model_cancel_saves_state_and_raises():
 
         raised = False
         try:
-            mgr.transfer_model(model_id, dest_dir="/Models")
-        except KeyboardInterrupt:
-            raised = True
+            try:
+                mgr.transfer_model(model_id, dest_dir="/Models")
+            except KeyboardInterrupt:
+                raised = True
+        finally:
+            tm.get_model_info, tm.get_free_space = orig_get_model_info, orig_get_free_space
 
         assert raised, "transfer_model must re-raise KeyboardInterrupt"
         # State must be checkpointed (valid JSON) so a resume run can pick up.

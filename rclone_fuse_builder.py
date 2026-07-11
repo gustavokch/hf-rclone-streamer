@@ -215,8 +215,13 @@ allowing the extension in System Preferences > Security & Privacy.
                 )
 
             print("Building rclone (this may take a few minutes)...")
+            # `cmount` is rclone's build tag for CGO/FUSE mount support — NOT
+            # `fuse`. Go silently ignores unknown -tags values, so `-tags fuse`
+            # would build successfully but produce a binary that LACKS
+            # `rclone mount` (only discovered later at mount time). Requires
+            # CGO_ENABLED=1 and macFUSE.
             subprocess.run(
-                ["go", "build", "-tags", "fuse", "-o", str(self.RCLONE_BINARY)],
+                ["go", "build", "-tags", "cmount", "-o", str(self.RCLONE_BINARY)],
                 cwd=str(build_dir / "rclone"),
                 check=True,
                 timeout=600

@@ -14,7 +14,10 @@ import subprocess
 from pathlib import Path
 from typing import Optional, List
 
-from rclone_client import get_rclone_binary
+try:
+    from .rclone_client import get_rclone_binary
+except ImportError:
+    from rclone_client import get_rclone_binary
 
 
 class SetupError(Exception):

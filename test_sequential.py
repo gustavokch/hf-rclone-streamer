@@ -50,12 +50,16 @@ def main():
 
         files = [FileInfo(path=f"f{i}.bin", size=100) for i in range(3)]
         # Stub network/rclone so transfer_model runs its sequential loop.
+        orig_get_model_info, orig_get_free_space = tm.get_model_info, tm.get_free_space
         tm.get_model_info = lambda **kw: ModelInfo(
             model_id=kw["model_id"], files=files, total_size=300
         )
         tm.get_free_space = lambda *a, **k: 10 ** 12
 
-        success = mgr.transfer_model("m/seq", dest_dir="/Models")
+        try:
+            success = mgr.transfer_model("m/seq", dest_dir="/Models")
+        finally:
+            tm.get_model_info, tm.get_free_space = orig_get_model_info, orig_get_free_space
         assert success is True, "all stubs succeed -> success should be True"
 
         expected = []

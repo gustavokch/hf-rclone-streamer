@@ -328,7 +328,9 @@ def _parse_free_space(info: Dict[str, Any]) -> int:
         "PiB": 1024**5, "PBytes": 1024**5, "PB": 1024**5,
     }
 
-    return int(value * unit_map.get(unit, 1))
+    # Unknown unit (e.g. a future rclone suffix like EiB) → 0, treated as
+    # "unknown" rather than misread as a handful of bytes.
+    return int(value * unit_map.get(unit, 0))
 
 
 def copy_to_mount(
@@ -489,7 +491,9 @@ def copy_direct(
     Bypasses the FUSE mount entirely, so the file lives on local disk only
     once (the aria2c temp copy) — no VFS staging duplicate. This is the
     minimal-disk upload path. ``--drive-chunk-size`` controls throughput:
-    larger chunks mean fewer API round-trips to Google Drive.
+    larger chunks mean fewer API round-trips to Google Drive. It is a Google
+    Drive backend flag, so this path assumes a GDrive remote (``--remote``);
+    rclone errors out if pointed at a different backend.
 
     Args:
         src: Source file path.
