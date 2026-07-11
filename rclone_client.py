@@ -303,6 +303,31 @@ def get_free_space(
     return _parse_free_space(info)
 
 
+# Size suffix → byte multiplier. Shared by the `rclone about` parser and the
+# rclone progress-line parser so both read "GiB", "GB", "GBytes", … the same
+# way. Unknown unit → 0 (treated as "unknown", not a handful of bytes).
+_SIZE_UNITS = {
+    "B": 1, "Byte": 1, "Bytes": 1,
+    "KiB": 1024, "KBytes": 1024, "KB": 1024,
+    "MiB": 1024**2, "MBytes": 1024**2, "MB": 1024**2,
+    "GiB": 1024**3, "GBytes": 1024**3, "GB": 1024**3,
+    "TiB": 1024**4, "TBytes": 1024**4, "TB": 1024**4,
+    "PiB": 1024**5, "PBytes": 1024**5, "PB": 1024**5,
+}
+
+
+def _parse_size_value(value: str, unit: str) -> int:
+    """Bytes represented by ``value`` (e.g. "2.930") with ``unit`` ("GiB").
+
+    Unknown unit or non-numeric value → 0 (treated as "unknown", not a handful
+    of bytes, and never raises — this runs on every rclone stdout line).
+    """
+    try:
+        return int(float(value) * _SIZE_UNITS.get(unit, 0))
+    except (ValueError, TypeError):
+        return 0
+
+
 def _parse_free_space(info: Dict[str, Any]) -> int:
     """Parse the 'Free' field from `rclone about` output into bytes.
 
@@ -316,21 +341,42 @@ def _parse_free_space(info: Dict[str, Any]) -> int:
     if not match:
         return 0
 
-    value = float(match.group(1))
-    unit = match.group(2)
+    return _parse_size_value(match.group(1), match.group(2))
 
-    unit_map = {
-        "B": 1, "Byte": 1, "Bytes": 1,
-        "KiB": 1024, "KBytes": 1024, "KB": 1024,
-        "MiB": 1024**2, "MBytes": 1024**2, "MB": 1024**2,
-        "GiB": 1024**3, "GBytes": 1024**3, "GB": 1024**3,
-        "TiB": 1024**4, "TBytes": 1024**4, "TB": 1024**4,
-        "PiB": 1024**5, "PBytes": 1024**5, "PB": 1024**5,
-    }
 
-    # Unknown unit (e.g. a future rclone suffix like EiB) → 0, treated as
-    # "unknown" rather than misread as a handful of bytes.
-    return int(value * unit_map.get(unit, 0))
+# rclone `--stats-one-line` transfer field, e.g. "2.930 GiB / 5.859 GiB".
+# Surfaced per second via ``--stats-log-level NOTICE`` (NOT ``--progress``: to a
+# non-TTY pipe rclone ``-P`` updates in place with ``\r`` and block-buffers the
+# whole run, flushing only at exit, so mid-run ticks never arrive — uploads then
+# report no progress). With NOTICE the line is prefixed like
+# ``NOTICE:   2.930 GiB / 5.859 GiB, 50%, ...`` and newline-flushed, so each
+# ``for line in stdout`` iteration is one tick. There is no "Transferred:" label,
+# so match the ``X unit / Y unit`` pair directly (tolerant of spaces around the
+# slash) and read transferred bytes from the first operand.
+_RCLONE_TRANSFER_RE = re.compile(
+    r"([\d.]+)\s*([KMGT]?i?B)\s*/\s*([\d.]+)\s*([KMGT]?i?B)"
+)
+
+
+def _rclone_transferred_bytes(line: str) -> Optional[int]:
+    """Bytes transferred so far, parsed from one rclone stats line.
+
+    Returns None for lines without a ``X / Y`` byte-transfer field (the
+    file-count "Transferred: N / N" line, "Checks:" lines, the rate field,
+    etc.) so the caller can skip them. Also None for a matched-but-garbage
+    number (the ``[\\d.]+`` group admits multi-dot strings like "1.2.3"): such
+    a line is skipped rather than feeding a spurious 0-byte sample to the
+    estimator.
+    """
+    match = _RCLONE_TRANSFER_RE.search(line)
+    if not match:
+        return None
+    value, unit = match.group(1), match.group(2)
+    try:
+        float(value)
+    except ValueError:
+        return None
+    return _parse_size_value(value, unit)
 
 
 def copy_to_mount(
@@ -410,6 +456,7 @@ def copy_with_rclone(
     """
     check_rclone_available()
 
+    total_size = src.stat().st_size
     last_error = None
 
     for attempt in range(max_retries):
@@ -425,9 +472,9 @@ def copy_with_rclone(
 
             cmd.extend([
                 "--drive-chunk-size", drive_chunk_size,
-                "--progress",
                 "--stats-one-line",
                 "--stats", "1s",
+                "--stats-log-level", "NOTICE",
             ])
 
             # Run rclone in its own session so cancellation is deterministic.
@@ -439,17 +486,17 @@ def copy_with_rclone(
                 start_new_session=True,
             ))
 
-            # Parse progress from output
-            size_pattern = re.compile(r"([\d.]+)([KMGT]?iB)")
+            if progress_callback:
+                progress_callback(0, total_size)
 
             try:
                 for line in process.stdout:
                     if cancel.is_set():
                         break
-                    # Look for progress info
-                    if "Transferred:" in line or "%" in line:
-                        # Extract progress if possible
-                        pass  # Progress parsing would go here
+                    if progress_callback:
+                        transferred = _rclone_transferred_bytes(line)
+                        if transferred is not None:
+                            progress_callback(transferred, total_size)
 
                 return_code = process.wait()
             finally:
@@ -460,6 +507,8 @@ def copy_with_rclone(
             if return_code != 0:
                 raise subprocess.CalledProcessError(return_code, cmd)
 
+            if progress_callback:
+                progress_callback(total_size, total_size)
             return  # Success
 
         except subprocess.CalledProcessError as e:
@@ -515,11 +564,8 @@ def copy_direct(
     total_size = src.stat().st_size
     last_error = None
 
-    # rclone --stats-one-line emits e.g.:
-    #   "Transferred: 1.500GiB / 10.000GiB, 15%, 50MiB/s, ETA 2m30s"
-    pct_pattern = re.compile(
-        r"Transferred:.*?([\d.]+)%"
-    )
+    # Progress is parsed from each rclone stats tick by the shared
+    # _rclone_transferred_bytes() helper (same wiring as copy_with_rclone).
 
     for attempt in range(max_retries):
         try:
@@ -528,9 +574,9 @@ def copy_direct(
                 str(src),
                 f"{remote_spec}{dest_path}",
                 "--drive-chunk-size", drive_chunk_size,
-                "--progress",
                 "--stats-one-line",
                 "--stats", "1s",
+                "--stats-log-level", "NOTICE",
             )
             if config_path:
                 cmd.extend(["--config", str(config_path)])
@@ -552,10 +598,9 @@ def copy_direct(
                     if cancel.is_set():
                         break
                     if progress_callback:
-                        match = pct_pattern.search(line)
-                        if match:
-                            pct = float(match.group(1))
-                            progress_callback(int(total_size * pct / 100), total_size)
+                        transferred = _rclone_transferred_bytes(line)
+                        if transferred is not None:
+                            progress_callback(transferred, total_size)
 
                 return_code = process.wait()
             finally:
