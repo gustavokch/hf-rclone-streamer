@@ -20,6 +20,7 @@ try:
     from .config import Config, get_config
     from .hf_api import search_models, get_model_info, format_size, print_model_summary
     from .transfer_manager import TransferManager, TransferProgress
+    from .rate_estimator import format_rate, format_eta
     from .rclone_client import (
         detect_mode,
         get_free_space,
@@ -33,6 +34,7 @@ except ImportError:
     from config import Config, get_config
     from hf_api import search_models, get_model_info, format_size, print_model_summary
     from transfer_manager import TransferManager, TransferProgress
+    from rate_estimator import format_rate, format_eta
     from rclone_client import (
         detect_mode,
         get_free_space,
@@ -307,12 +309,16 @@ def cmd_download(args: argparse.Namespace, config: Config) -> int:
             download_pct = 0
             upload_pct = 0
 
+        # Labels shortened to DL/UL to reclaim width for the live speed (inside
+        # the parens) and the completion ETA. During warmup the trailing fields
+        # read "—" and "ETA calculating…".
         print(
             f"\rProgress: {progress.completed_files}/{progress.total_files} files | "
-            f"Download: {format_size(progress.downloaded_bytes)}/{format_size(progress.total_bytes)} "
-            f"({download_pct:.1f}%) | "
-            f"Upload: {rclone_format_size(progress.uploaded_bytes)}/{format_size(progress.total_bytes)} "
-            f"({upload_pct:.1f}%)",
+            f"DL: {format_size(progress.downloaded_bytes)}/{format_size(progress.total_bytes)} "
+            f"({download_pct:.1f}%, {format_rate(progress.download_rate)}) | "
+            f"UL: {rclone_format_size(progress.uploaded_bytes)}/{format_size(progress.total_bytes)} "
+            f"({upload_pct:.1f}%, {format_rate(progress.upload_rate)}) | "
+            f"ETA {format_eta(progress.eta_seconds)}",
             end="",
             flush=True,
         )

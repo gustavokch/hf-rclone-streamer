@@ -18,6 +18,7 @@ import time
 try:
     from .config import Config, get_config
     from .cancel import CancelToken, NO_CANCEL
+    from .rate_estimator import RateEstimator, format_rate, format_eta
     from .hf_api import (
         ModelInfo, FileInfo,
         get_model_info,
@@ -33,6 +34,7 @@ except ImportError:
     # Absolute imports for running directly
     from config import Config, get_config
     from cancel import CancelToken, NO_CANCEL
+    from rate_estimator import RateEstimator, format_rate, format_eta
     from hf_api import (
         ModelInfo, FileInfo,
         get_model_info,
@@ -70,6 +72,11 @@ class TransferProgress:
     downloaded_bytes: int
     uploaded_bytes: int
     failed_files: int
+    # Derived rates/ETA (None until enough samples arrive). Optional with
+    # defaults so existing positional construction still works.
+    download_rate: Optional[float] = None
+    upload_rate: Optional[float] = None
+    eta_seconds: Optional[float] = None
 
 
 class TransferManager:
@@ -102,6 +109,12 @@ class TransferManager:
         # at the start of each transfer_model() call; setting it terminates
         # any in-flight aria2c/rclone subprocess so Ctrl-C exits promptly.
         self._cancel = CancelToken()
+
+        # Per-stream rate estimators, fed from _notify_progress with the
+        # cumulative downloaded/uploaded bytes. Read by _populate_rates for the
+        # live speed and ETA display.
+        self._download_estimator = RateEstimator()
+        self._upload_estimator = RateEstimator()
 
         # Ensure cache directory exists
         self.cache_dir = self.config.ensure_cache_dir()
@@ -196,12 +209,53 @@ class TransferManager:
             self._notify_progress()
 
     def _notify_progress(self) -> None:
-        """Notify progress callback if set."""
-        if not self.progress_callback:
-            return
+        """Sample the rate estimators and notify the progress callback.
 
+        Always samples (even with no callback) so ``get_progress``/``print_status``
+        report live rates during a callback-less transfer; the callback itself is
+        conditional. Runs under ``_state_lock`` (held by ``_update_state``); the
+        estimators add their own locks in a one-way order, so no deadlock.
+        """
         progress = self._calculate_progress()
-        self.progress_callback(progress)
+        now = time.time()
+        self._download_estimator.sample(now, progress.downloaded_bytes)
+        self._upload_estimator.sample(now, progress.uploaded_bytes)
+        self._populate_rates(progress)
+        if self.progress_callback:
+            self.progress_callback(progress)
+
+    def _populate_rates(self, progress: TransferProgress) -> None:
+        """Set download/upload rates and ETA on ``progress``.
+
+        Reads last-known rates from the estimators (no sampling), so this is
+        safe to call from ``get_progress`` without ``_state_lock``.
+        """
+        progress.download_rate = self._download_estimator.current_rate()
+        progress.upload_rate = self._upload_estimator.current_rate()
+        progress.eta_seconds = self._compute_eta(progress)
+
+    def _compute_eta(self, progress: TransferProgress) -> Optional[float]:
+        """Completion ETA, upload-based with a download warmup fallback.
+
+        The transfer is "complete" when all bytes are on GDrive, so the upload
+        rate is the honest basis. With the depth-1 pipeline, when download is
+        the bottleneck ``uploaded_bytes`` still advances at ~the download rate
+        (one shard lagged), so this stays sane in both bottleneck cases. While
+        the first shard is still downloading (no upload sample yet), fall back
+        to the download rate over total remaining bytes as a provisional bound
+        — avoiding minutes of "calculating…" on a large first shard.
+        """
+        remaining_upload = progress.total_bytes - progress.uploaded_bytes
+        if remaining_upload <= 0:
+            return 0.0
+        upload_eta = self._upload_estimator.eta(remaining_upload)
+        if upload_eta is not None:
+            return upload_eta
+        # Warmup: first shard still downloading, no upload sample yet.
+        remaining_total = progress.total_bytes - progress.downloaded_bytes
+        if remaining_total > 0:
+            return self._download_estimator.eta(remaining_total)
+        return None
 
     def _calculate_progress(self) -> TransferProgress:
         """Calculate overall transfer progress.
@@ -680,7 +734,9 @@ class TransferManager:
         Returns:
             TransferProgress object.
         """
-        return self._calculate_progress()
+        progress = self._calculate_progress()
+        self._populate_rates(progress)  # last-known rates; no sampling, no lock
+        return progress
 
     def get_failed_transfers(self) -> List[TransferState]:
         """Get list of failed transfers.
@@ -712,6 +768,11 @@ class TransferManager:
         print(f"\nProgress:")
         print(f"Downloaded: {hf_format_size(progress.downloaded_bytes)} / {hf_format_size(progress.total_bytes)}")
         print(f"Uploaded: {rclone_format_size(progress.uploaded_bytes)} / {hf_format_size(progress.total_bytes)}")
+        print(
+            f"Rate: Download {format_rate(progress.download_rate)} | "
+            f"Upload {format_rate(progress.upload_rate)} | "
+            f"ETA {format_eta(progress.eta_seconds)}"
+        )
 
         if progress.failed_files > 0:
             print("\nFailed Files:")
