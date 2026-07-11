@@ -18,7 +18,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rclone_client import _parse_free_space, copy_direct
+from rclone_client import _parse_free_space, _parse_size_value, copy_direct
 
 
 def check(name, free_str, expected):
@@ -94,6 +94,25 @@ def test_rclone_transferred_bytes():
     assert f("Checks: 2 / 2, 100%") is None
     assert f("0 B/s, ETA -") is None               # rate field, not transfer
 
+    # A matched-but-garbage number (the ``[\d.]+`` group admits multi-dot
+    # strings) must be skipped, not fed to the estimator as a 0-byte tick.
+    # This runs on every rclone stdout line, so it must not raise either.
+    assert f("1.2.3 GiB / 5 GiB, 50%") is None
+
+
+def test_parse_size_value_never_raises():
+    """The shared size primitive must not raise on bad input.
+
+    It runs on every rclone stdout line (via ``_rclone_transferred_bytes``) and
+    inside ``_parse_free_space``; a stray ``ValueError`` would abort a transfer
+    mid-stream. Non-numeric → 0 (the "unknown" sentinel), matching unknown
+    units.
+    """
+    assert _parse_size_value("abc", "GiB") == 0
+    assert _parse_size_value("1.2.3", "GiB") == 0
+    # Known-good still works.
+    assert _parse_size_value("2.930", "GiB") == int(2.930 * 1024 ** 3)
+
 
 def test_copy_direct_reports_progress_real_format():
     """copy_direct must stream per-second progress via NOTICE stats.
@@ -160,6 +179,7 @@ def main():
     test_unknown_unit_is_zero()
     test_missing_or_malformed()
     test_rclone_transferred_bytes()
+    test_parse_size_value_never_raises()
     test_copy_direct_reports_progress_real_format()
     print("All test_rclone_client tests passed.")
 

@@ -255,14 +255,14 @@ class TransferManager:
         remaining_upload = progress.total_bytes - progress.uploaded_bytes
         if remaining_upload <= 0:
             return 0.0
-        upload_eta = self._upload_estimator.eta(remaining_upload)
-        if upload_eta is not None:
-            return upload_eta
+        blended = self._upload_estimator.blended_rate()
+        if blended is not None and blended > 0:
+            return remaining_upload / blended
         # Warmup only: no upload rate yet (first shard still downloading). A
-        # genuine *stall* (upload has samples but blended_rate() == 0.0) must
-        # NOT fall through to a download-based ETA — that would tick down while
-        # the upload (the completion gate) is stuck. Let it read "calculating…".
-        if self._upload_estimator.blended_rate() is None:
+        # genuine *stall* (blended == 0.0, not None) must NOT fall through to a
+        # download-based ETA — that would tick down while the upload (the
+        # completion gate) is stuck. Let it read "calculating…".
+        if blended is None:
             remaining_total = progress.total_bytes - progress.downloaded_bytes
             if remaining_total > 0:
                 return self._download_estimator.eta(remaining_total)

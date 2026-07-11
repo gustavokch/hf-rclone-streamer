@@ -154,7 +154,7 @@ class Aria2cDownloader:
 
     def __init__(
         self,
-        connections: int = 16,
+        connections: int = 6,
         max_retries: int = 3,
         retry_delay: int = 5,
     ):

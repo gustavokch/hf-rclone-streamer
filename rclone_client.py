@@ -317,8 +317,15 @@ _SIZE_UNITS = {
 
 
 def _parse_size_value(value: str, unit: str) -> int:
-    """Bytes represented by ``value`` (e.g. "2.930") with ``unit`` ("GiB")."""
-    return int(float(value) * _SIZE_UNITS.get(unit, 0))
+    """Bytes represented by ``value`` (e.g. "2.930") with ``unit`` ("GiB").
+
+    Unknown unit or non-numeric value → 0 (treated as "unknown", not a handful
+    of bytes, and never raises — this runs on every rclone stdout line).
+    """
+    try:
+        return int(float(value) * _SIZE_UNITS.get(unit, 0))
+    except (ValueError, TypeError):
+        return 0
 
 
 def _parse_free_space(info: Dict[str, Any]) -> int:
@@ -356,12 +363,20 @@ def _rclone_transferred_bytes(line: str) -> Optional[int]:
 
     Returns None for lines without a ``X / Y`` byte-transfer field (the
     file-count "Transferred: N / N" line, "Checks:" lines, the rate field,
-    etc.) so the caller can skip them.
+    etc.) so the caller can skip them. Also None for a matched-but-garbage
+    number (the ``[\\d.]+`` group admits multi-dot strings like "1.2.3"): such
+    a line is skipped rather than feeding a spurious 0-byte sample to the
+    estimator.
     """
     match = _RCLONE_TRANSFER_RE.search(line)
     if not match:
         return None
-    return _parse_size_value(match.group(1), match.group(2))
+    value, unit = match.group(1), match.group(2)
+    try:
+        float(value)
+    except ValueError:
+        return None
+    return _parse_size_value(value, unit)
 
 
 def copy_to_mount(
@@ -471,6 +486,9 @@ def copy_with_rclone(
                 start_new_session=True,
             ))
 
+            if progress_callback:
+                progress_callback(0, total_size)
+
             try:
                 for line in process.stdout:
                     if cancel.is_set():
@@ -489,6 +507,8 @@ def copy_with_rclone(
             if return_code != 0:
                 raise subprocess.CalledProcessError(return_code, cmd)
 
+            if progress_callback:
+                progress_callback(total_size, total_size)
             return  # Success
 
         except subprocess.CalledProcessError as e:
