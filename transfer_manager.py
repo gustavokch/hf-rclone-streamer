@@ -259,7 +259,11 @@ class TransferManager:
 
         # Check available space
         try:
-            free_space = get_free_space(self.config.rclone_path)
+            free_space = get_free_space(
+                self.config.rclone_path,
+                remote=self.config.remote,
+                no_mount=self.config.no_mount,
+            )
             if free_space < model_info.total_size:
                 print(f"Warning: Not enough space on GDrive")
                 print(f"Available: {rclone_format_size(free_space)}")
@@ -367,6 +371,9 @@ class TransferManager:
                 src=Path(cache_path),
                 rclone_path=self.config.rclone_path,
                 dest_dir=dest_dir,
+                remote=self.config.remote,
+                no_mount=self.config.no_mount,
+                drive_chunk_size=self.config.drive_chunk_size,
                 progress_callback=lambda copied, total: self._update_state(
                     key, uploaded_bytes=copied
                 ),

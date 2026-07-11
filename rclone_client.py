@@ -14,6 +14,32 @@ import time
 import re
 
 
+# The rclone binary to invoke. Defaults to the FUSE-enabled build so `mount`
+# works on macOS; override via HF_RCLONE_RCLONE_BINARY env var or Config.
+RCLONE_BINARY = os.environ.get("HF_RCLONE_RCLONE_BINARY", "rclone-fuse")
+
+
+def set_rclone_binary(binary: Optional[str]) -> None:
+    """Override the rclone binary used by all functions in this module.
+
+    Args:
+        binary: Path or name of the rclone binary (e.g. "rclone-fuse").
+    """
+    global RCLONE_BINARY
+    if binary:
+        RCLONE_BINARY = binary
+
+
+def get_rclone_binary() -> str:
+    """Return the rclone binary currently in use."""
+    return RCLONE_BINARY
+
+
+def _rclone_cmd(*args: str) -> List[str]:
+    """Build an rclone command list using the configured binary."""
+    return [RCLONE_BINARY, *args]
+
+
 @dataclass
 class RcloneMode:
     """Detected rclone operation mode."""
@@ -48,14 +74,16 @@ class CopyError(RcloneError):
 
 
 def check_rclone_available() -> None:
-    """Check if rclone is available in PATH.
+    """Check if the configured rclone binary is available in PATH.
 
     Raises:
-        RcloneNotFoundError: If rclone is not found.
+        RcloneNotFoundError: If the rclone binary is not found.
     """
-    if not shutil.which("rclone"):
+    if not shutil.which(RCLONE_BINARY):
         raise RcloneNotFoundError(
-            "rclone not found in PATH. Install it from https://rclone.org/"
+            f"rclone binary '{RCLONE_BINARY}' not found in PATH. "
+            "Build it with: python run.py setup-fuse, or point at a different "
+            "binary via --rclone-binary / HF_RCLONE_RCLONE_BINARY."
         )
 
 
@@ -137,7 +165,7 @@ def get_remotes(config_path: Optional[Path] = None) -> List[str]:
     """
     check_rclone_available()
 
-    cmd = ["rclone", "listremotes"]
+    cmd = _rclone_cmd("listremotes")
     if config_path:
         cmd.extend(["--config", str(config_path)])
 
@@ -166,7 +194,7 @@ def get_remote_info(remote: str, config_path: Optional[Path] = None) -> Dict[str
     """
     check_rclone_available()
 
-    cmd = ["rclone", "about", remote]
+    cmd = _rclone_cmd("about", remote)
     if config_path:
         cmd.extend(["--config", str(config_path)])
 
@@ -190,19 +218,67 @@ def get_remote_info(remote: str, config_path: Optional[Path] = None) -> Dict[str
         raise RcloneError(f"Failed to get remote info: {e.stderr}")
 
 
+def resolve_remote(
+    rclone_path: Optional[str] = None,
+    remote: Optional[str] = None,
+    config_path: Optional[Path] = None,
+) -> str:
+    """Resolve the remote name to use for direct/config operations.
+
+    Precedence: explicit `remote` arg > `rclone_path` if it names a remote >
+    first configured remote (auto-detect).
+
+    Args:
+        rclone_path: Optional path that may be a remote spec (e.g. "drive-gkch:").
+        remote: Explicit remote name.
+        config_path: Optional rclone config file path.
+
+    Returns:
+        Remote name without trailing colon (e.g. "drive-gkch").
+    """
+    check_rclone_available()
+
+    if remote:
+        return remote.rstrip(":")
+
+    # If rclone_path looks like a remote spec (e.g. "drive-gkch:" or "drive-gkch")
+    # rather than a filesystem path, treat it as the remote name.
+    if rclone_path and "/" not in rclone_path and "\\" not in rclone_path:
+        candidate = rclone_path.strip()
+        if not Path(candidate).exists():
+            return candidate.rstrip(":")
+
+    remotes = get_remotes(config_path)
+    if not remotes:
+        raise RcloneError(
+            "No rclone remotes configured. Run 'rclone config' to create one."
+        )
+    return remotes[0].rstrip(":")
+
+
 def get_free_space(
     rclone_path: Optional[str] = None,
     remote: Optional[str] = None,
+    no_mount: bool = False,
 ) -> int:
     """Get free space on Google Drive.
 
     Args:
-        rclone_path: Path to mount or config file.
-        remote: Remote name for config mode.
+        rclone_path: Path to mount or config file (ignored in no_mount mode).
+        remote: Remote name for config/no-mount mode.
+        no_mount: If True, query the remote directly via `rclone about`.
 
     Returns:
         Free space in bytes.
     """
+    check_rclone_available()
+
+    # Direct/no-mount mode (or no path given): query the remote via `rclone about`.
+    if no_mount or rclone_path is None:
+        resolved = resolve_remote(None, remote)
+        info = get_remote_info(f"{resolved}:")
+        return _parse_free_space(info)
+
     mode = detect_mode(rclone_path)
 
     if mode.mode == "mount":
@@ -218,22 +294,32 @@ def get_free_space(
         remote = remotes[0]
 
     info = get_remote_info(remote, mode.path)
+    return _parse_free_space(info)
+
+
+def _parse_free_space(info: Dict[str, Any]) -> int:
+    """Parse the 'Free' field from `rclone about` output into bytes.
+
+    Handles both `rclone about` suffix styles: "4.999TiB" (default) and
+    "12.5GBytes" (--full).
+    """
     free_str = info.get("Free", "0")
 
-    # Parse size string (e.g., "12.5GBytes")
-    match = re.match(r"([\d.]+)(\w+)", free_str)
+    # Number, optional whitespace, then a unit of letters.
+    match = re.search(r"([\d.]+)\s*([A-Za-z]+)", free_str)
     if not match:
         return 0
 
-    value, unit = match.groups()
-    value = float(value)
+    value = float(match.group(1))
+    unit = match.group(2)
 
     unit_map = {
-        "Bytes": 1,
-        "KBytes": 1024,
-        "MBytes": 1024**2,
-        "GBytes": 1024**3,
-        "TBytes": 1024**4,
+        "B": 1, "Byte": 1, "Bytes": 1,
+        "KiB": 1024, "KBytes": 1024, "KB": 1024,
+        "MiB": 1024**2, "MBytes": 1024**2, "MB": 1024**2,
+        "GiB": 1024**3, "GBytes": 1024**3, "GB": 1024**3,
+        "TiB": 1024**4, "TBytes": 1024**4, "TB": 1024**4,
+        "PiB": 1024**5, "PBytes": 1024**5, "PB": 1024**5,
     }
 
     return int(value * unit_map.get(unit, 1))
@@ -291,6 +377,7 @@ def copy_with_rclone(
     progress_callback: Optional[Callable[[int, int], None]] = None,
     max_retries: int = 3,
     retry_delay: int = 5,
+    drive_chunk_size: str = "64M",
 ) -> None:
     """Copy a file using rclone CLI.
 
@@ -302,6 +389,7 @@ def copy_with_rclone(
         progress_callback: Optional callback(bytes_copied, total_bytes).
         max_retries: Maximum retry attempts.
         retry_delay: Seconds between retries.
+        drive_chunk_size: GDrive upload chunk size (default 64M).
 
     Raises:
         CopyError: If copy fails after all retries.
@@ -312,17 +400,17 @@ def copy_with_rclone(
 
     for attempt in range(max_retries):
         try:
-            cmd = [
-                "rclone",
+            cmd = _rclone_cmd(
                 "copyto",
                 str(src),
                 f"{remote}{dest_path}",
-            ]
+            )
 
             if config_path:
                 cmd.extend(["--config", str(config_path)])
 
             cmd.extend([
+                "--drive-chunk-size", drive_chunk_size,
                 "--progress",
                 "--stats-one-line",
                 "--stats", "1s",
@@ -363,22 +451,126 @@ def copy_with_rclone(
     )
 
 
+def copy_direct(
+    src: Path,
+    remote: str,
+    dest_path: str,
+    config_path: Optional[Path] = None,
+    drive_chunk_size: str = "64M",
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    max_retries: int = 3,
+    retry_delay: int = 5,
+) -> None:
+    """Upload a single file directly to the remote via `rclone copyto`.
+
+    Bypasses the FUSE mount entirely, so the file lives on local disk only
+    once (the aria2c temp copy) — no VFS staging duplicate. This is the
+    minimal-disk upload path. ``--drive-chunk-size`` controls throughput:
+    larger chunks mean fewer API round-trips to Google Drive.
+
+    Args:
+        src: Source file path.
+        remote: Remote name (e.g. "drive-gkch").
+        dest_path: Destination path on remote (e.g. "/Models/file.bin").
+        config_path: Optional rclone config file.
+        drive_chunk_size: GDrive upload chunk size (default 64M).
+        progress_callback: Optional callback(bytes_copied, total_bytes).
+        max_retries: Maximum retry attempts.
+        retry_delay: Seconds between retries.
+
+    Raises:
+        CopyError: If copy fails after all retries.
+    """
+    check_rclone_available()
+
+    remote_spec = f"{remote.rstrip(':')}:"
+    total_size = src.stat().st_size
+    last_error = None
+
+    # rclone --stats-one-line emits e.g.:
+    #   "Transferred: 1.500GiB / 10.000GiB, 15%, 50MiB/s, ETA 2m30s"
+    pct_pattern = re.compile(
+        r"Transferred:.*?([\d.]+)%"
+    )
+
+    for attempt in range(max_retries):
+        try:
+            cmd = _rclone_cmd(
+                "copyto",
+                str(src),
+                f"{remote_spec}{dest_path}",
+                "--drive-chunk-size", drive_chunk_size,
+                "--progress",
+                "--stats-one-line",
+                "--stats", "1s",
+            )
+            if config_path:
+                cmd.extend(["--config", str(config_path)])
+
+            # Run rclone and capture progress
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+            if progress_callback:
+                progress_callback(0, total_size)
+
+            for line in process.stdout:
+                if progress_callback:
+                    match = pct_pattern.search(line)
+                    if match:
+                        pct = float(match.group(1))
+                        progress_callback(int(total_size * pct / 100), total_size)
+
+            return_code = process.wait()
+
+            if return_code != 0:
+                raise subprocess.CalledProcessError(return_code, cmd)
+
+            if progress_callback:
+                progress_callback(total_size, total_size)
+            return  # Success
+
+        except subprocess.CalledProcessError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                continue
+
+    raise CopyError(
+        f"Failed to copy {src} to {remote_spec}{dest_path} "
+        f"after {max_retries} attempts: {last_error}"
+    )
+
+
 def copy_file(
     src: Path,
     rclone_path: Optional[str] = None,
     dest_dir: str = "/Models",
     remote: Optional[str] = None,
+    no_mount: bool = False,
+    drive_chunk_size: str = "64M",
     progress_callback: Optional[Callable[[int, int], None]] = None,
     max_retries: int = 3,
     retry_delay: int = 5,
 ) -> None:
     """Copy a file to Google Drive using the appropriate mode.
 
+    Three modes:
+      - no_mount=True: direct `rclone copyto` (1x disk, no FUSE mount needed).
+      - rclone_path is a directory: write through the FUSE mount (2x disk peak).
+      - rclone_path is a config file: `rclone copyto` with that config.
+
     Args:
         src: Source file path.
-        rclone_path: Path to mount or config file.
+        rclone_path: Path to mount or config file (or a remote spec in no_mount).
         dest_dir: Destination directory on GDrive.
-        remote: Remote name for config mode.
+        remote: Remote name for config/no-mount mode (auto-detected if None).
+        no_mount: Bypass the FUSE mount and upload directly.
+        drive_chunk_size: GDrive upload chunk size (default 64M).
         progress_callback: Optional progress callback.
         max_retries: Maximum retry attempts.
         retry_delay: Seconds between retries.
@@ -386,6 +578,20 @@ def copy_file(
     Raises:
         RcloneError: If operation fails.
     """
+    if no_mount:
+        resolved = resolve_remote(rclone_path, remote)
+        dest_path = f"{dest_dir}/{src.name}"
+        copy_direct(
+            src=src,
+            remote=resolved,
+            dest_path=dest_path,
+            drive_chunk_size=drive_chunk_size,
+            progress_callback=progress_callback,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+        )
+        return
+
     mode = detect_mode(rclone_path)
 
     if mode.mode == "mount":
@@ -406,6 +612,7 @@ def copy_file(
             progress_callback=progress_callback,
             max_retries=max_retries,
             retry_delay=retry_delay,
+            drive_chunk_size=drive_chunk_size,
         )
 
 
@@ -428,7 +635,7 @@ def verify_upload(
 
     try:
         # Use rclone check to verify
-        cmd = ["rclone", "check", str(local), remote_path]
+        cmd = _rclone_cmd("check", str(local), remote_path)
         if config_path:
             cmd.extend(["--config", str(config_path)])
 
@@ -464,7 +671,7 @@ def list_directory(
     """
     check_rclone_available()
 
-    cmd = ["rclone", "ls", remote_path]
+    cmd = _rclone_cmd("ls", remote_path)
     if config_path:
         cmd.extend(["--config", str(config_path)])
 
@@ -500,7 +707,7 @@ def ensure_directory(
     """
     check_rclone_available()
 
-    cmd = ["rclone", "mkdir", remote_path]
+    cmd = _rclone_cmd("mkdir", remote_path)
     if config_path:
         cmd.extend(["--config", str(config_path)])
 

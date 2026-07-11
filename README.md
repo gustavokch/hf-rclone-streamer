@@ -49,18 +49,48 @@ Stream Hugging Face model downloads to Google Drive via rclone, using localhost 
 
 ### Optional: Mount Google Drive
 
-For better performance, mount Google Drive locally:
+For the mount upload mode, mount Google Drive locally. On macOS the Homebrew
+`rclone` does **not** support FUSE mounting — build a FUSE-enabled binary first
+with `python run.py setup-fuse` (installs `rclone-fuse`).
 
 ```bash
 # Create mount point
 mkdir -p ~/gdrive
 
-# Mount (runs in foreground)
-rclone mount gdrive: ~/gdrive --vfs-cache-mode full
-
-# Or mount in background with logging
-rclone mount gdrive: ~/gdrive --vfs-cache-mode full --daemon --log-file /tmp/rclone.log
+# Mount in the background with optimized flags (min disk / max throughput)
+rclone-fuse mount drive-gkch: ~/gdrive \
+    --vfs-cache-mode writes --vfs-cache-max-size 10G --vfs-cache-max-age 1h \
+    --vfs-cache-poll-interval 1m --drive-chunk-size 64M --buffer-size 32M \
+    --low-level-retries 10 --dir-cache-time 1h --attr-timeout 1h \
+    --noappledouble --noapplexattr \
+    --daemon --log-file ~/rclone.log --log-level INFO
 ```
+
+The `setup` command prints this same optimized command for you.
+
+## Upload Modes: mount vs `--no-mount`
+
+The streamer downloads each file to a local cache (`--cache-dir`), then uploads
+it to Google Drive. There are two upload paths:
+
+| Mode | How | Peak local disk | When to use |
+|------|-----|-----------------|-------------|
+| **mount** (default) | Writes through the FUSE mount point (`--rclone-path ~/gdrive`) | ~2× file (cache **+** rclone VFS staging copy) | You want random-access to Drive files via the mount |
+| **`--no-mount`** | `rclone-fuse copyto <file> <remote>:<dest> --drive-chunk-size 64M` | ~1× file (cache only; no VFS duplicate) | Low free disk, or no mount point available |
+
+With `--no-mount`, no FUSE mount is required — the streamer uploads each cached
+file straight to the remote:
+
+```bash
+python run.py --no-mount --remote drive-gkch download meta-llama/Llama-3.1-8B
+```
+
+`--drive-chunk-size` (default `64M`) is the main throughput lever for Google
+Drive uploads: larger chunks mean fewer API round-trips. Raise it to `128M` on a
+machine with memory to spare.
+
+> Note: global options like `--no-mount` and `--rclone-path` must appear
+> **before** the subcommand (`python run.py --no-mount download <model>`).
 
 ## Installation
 
@@ -224,6 +254,10 @@ python hf_rclone_streamer.py status
 | `--hf-token` | Hugging Face auth token | None |
 | `--no-aria2c` | Disable aria2c | False |
 | `--aria2c-connections` | aria2c connections per file | 16 |
+| `--rclone-binary` | rclone binary to invoke | `rclone-fuse` |
+| `--no-mount` | Bypass FUSE mount; upload via `rclone copyto` (½ disk) | False |
+| `--remote` | rclone remote name (no-mount/config mode) | Auto-detect |
+| `--drive-chunk-size` | GDrive upload chunk size | `64M` |
 
 ### Commands
 
