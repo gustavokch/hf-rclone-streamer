@@ -24,17 +24,18 @@ try:
         list_repo_tree,
         get_hf_file_metadata,
         list_models,
-        ModelFilter,
-        RepositoryNotFoundError,
         HfApi,
     )
-    from huggingface_hub.utils import (
-        RepositoryNotFoundError as RepoNotFound,
-        RevisionNotFoundError,
-    )
+    # Check if RepoFile is available (newer API)
+    try:
+        from huggingface_hub.hf_api import RepoFile
+        HAS_REPOFILE_CLASS = True
+    except ImportError:
+        HAS_REPOFILE_CLASS = False
     HF_AVAILABLE = True
 except ImportError:
     HF_AVAILABLE = False
+    HAS_REPOFILE_CLASS = False
 
 
 @dataclass
@@ -367,20 +368,17 @@ def search_models(
     """
     check_hf_available()
 
-    model_filter = ModelFilter()
-    if author:
-        model_filter.author = author
-    if tags:
-        model_filter.tags = tags
+    api = HfApi(token=token)
 
     try:
-        models = list_models(
+        # New API uses keyword arguments directly
+        models = api.list_models(
             search=query,
-            filter=model_filter,
+            author=author,
+            tags=tags,
             limit=limit,
-            token=token,
         )
-        return [model.modelId for model in models]
+        return [model.id for model in models]
     except Exception as e:
         raise HFApiError(f"Failed to search models: {e}")
 
@@ -424,42 +422,50 @@ def get_model_info(
         total_size = 0
 
         for item in repo_tree:
-            if item.type == "file":
-                file_path = item.path
+            # Check if item is a file (new API uses RepoFile class, old API uses type attribute)
+            is_file = HAS_REPOFILE_CLASS and isinstance(item, RepoFile)
+            if not is_file and hasattr(item, 'type'):
+                is_file = item.type == "file"
 
-                # Apply inclusion filters
-                if include_patterns and not any(
-                    fnmatch.fnmatch(file_path, pattern)
-                    for pattern in include_patterns
-                ):
-                    continue
+            if not is_file:
+                continue
 
-                # Apply exclusion filters
-                if exclude_patterns and any(
-                    fnmatch.fnmatch(file_path, pattern)
-                    for pattern in exclude_patterns
-                ):
-                    continue
+            file_path = item.path
 
-                # Get file size
+            # Apply inclusion filters
+            if include_patterns and not any(
+                fnmatch.fnmatch(file_path, pattern)
+                for pattern in include_patterns
+            ):
+                continue
+
+            # Apply exclusion filters
+            if exclude_patterns and any(
+                fnmatch.fnmatch(file_path, pattern)
+                for pattern in exclude_patterns
+            ):
+                continue
+
+            # Get file size (RepoFile has size attribute)
+            if hasattr(item, 'size'):
+                file_size = item.size
+            else:
+                # Fallback to getting metadata
                 try:
-                    metadata = get_hf_file_metadata(
-                        repo_id=model_id,
-                        filename=file_path,
-                        revision=revision,
-                        token=token,
-                    )
+                    from huggingface_hub import hf_hub_url
+                    url = hf_hub_url(repo_id=model_id, filename=file_path, revision=revision)
+                    metadata = get_hf_file_metadata(url, token=token)
                     file_size = metadata.size
                 except Exception:
                     file_size = 0
 
-                file_info = FileInfo(
-                    path=file_path,
-                    size=file_size,
-                    blob_id=item.blob_id,
-                )
-                files.append(file_info)
-                total_size += file_size
+            file_info = FileInfo(
+                path=file_path,
+                size=file_size,
+                blob_id=item.blob_id,
+            )
+            files.append(file_info)
+            total_size += file_size
 
         # Extract author from model ID or model data
         author = model_data.author
@@ -478,10 +484,13 @@ def get_model_info(
             card_data=model_data.card_data if hasattr(model_data, 'card_data') else {},
         )
 
-    except RepositoryNotFoundError as e:
-        raise ModelNotFoundError(f"Model not found: {model_id}") from e
     except Exception as e:
-        raise HFApiError(f"Failed to get model info: {e}")
+        # Check if it's a "not found" error
+        error_str = str(e).lower()
+        if 'not found' in error_str or 'does not exist' in error_str or '404' in error_str:
+            raise ModelNotFoundError(f"Model not found: {model_id}") from e
+        else:
+            raise HFApiError(f"Failed to get model info: {e}") from e
 
 
 def get_file_size(
@@ -691,7 +700,7 @@ def list_model_files(
             token=token,
             repo_type="model",
         )
-    except RepositoryNotFoundError as e:
+    except Exception as e:
         raise ModelNotFoundError(f"Model not found: {model_id}") from e
     except Exception as e:
         raise HFApiError(f"Failed to list files: {e}")
@@ -730,7 +739,7 @@ def get_file_info(
             commit_hash=metadata.commit_hash,
             blob_id=metadata.blob_id,
         )
-    except RepositoryNotFoundError as e:
+    except Exception as e:
         raise ModelNotFoundError(f"Model not found: {model_id}") from e
     except Exception as e:
         raise HFApiError(f"Failed to get file info: {e}")
