@@ -185,10 +185,13 @@ class Config:
 
     @property
     def default_model_id(self) -> str:
-        """Get the model downloaded when no model ID is given."""
-        return self.get(
-            "default_model_id", "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF"
-        )
+        """Get the model downloaded when no model ID is given.
+
+        Falls back to DEFAULTS when the stored value is null/empty — a YAML
+        ``default_model_id:`` (no value) stores None and would otherwise leak
+        through as a model ID.
+        """
+        return self.get("default_model_id") or self.DEFAULTS["default_model_id"]
 
     @property
     def quant(self) -> Optional[str]:
