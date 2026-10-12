@@ -5,6 +5,7 @@ Supports environment variable overrides and XDG config directory.
 """
 
 import os
+import warnings
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -96,10 +97,18 @@ class Config:
         Args:
             config_file: Path to config file. If None, tries default location.
         """
+        explicit = config_file is not None
         if config_file is None:
             config_file = self.config_dir / "config.yaml"
 
         if not config_file.exists():
+            if not explicit:
+                legacy = self.config_dir / "config.json"
+                if legacy.exists():
+                    warnings.warn(
+                        f"Legacy config file {legacy} is no longer read; rename "
+                        f"it to {legacy.with_suffix('.yaml')} to keep your settings"
+                    )
             return
 
         try:
@@ -109,7 +118,6 @@ class Config:
                     self._config.update(user_config)
         except (yaml.YAMLError, IOError) as e:
             # Don't fail on config file errors, just warn
-            import warnings
             warnings.warn(f"Failed to load config file: {e}")
 
     def _load_from_env(self) -> None:

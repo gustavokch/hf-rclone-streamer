@@ -73,6 +73,34 @@ def test_missing_file_falls_back_to_defaults():
     assert cfg.dest_dir == "/Models", f"dest_dir: {cfg.dest_dir!r}"
 
 
+def test_legacy_json_config_warns():
+    """config.json beside a missing config.yaml ⇒ warn (settings silently lost otherwise)."""
+    import warnings
+    with tempfile.TemporaryDirectory() as td:
+        xdg = Path(td) / "xdg"
+        (xdg / "hf-rclone-streamer").mkdir(parents=True)
+        (xdg / "hf-rclone-streamer" / "config.json").write_text('{"dest_dir": "/Legacy"}')
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg)}):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                cfg = Config()
+    assert any("config.json" in str(w.message) for w in caught), [
+        str(w.message) for w in caught
+    ]
+    assert cfg.dest_dir == "/Models", f"dest_dir: {cfg.dest_dir!r}"
+
+
+def test_missing_explicit_config_warns():
+    """An explicit --config path that does not exist must not fail silently."""
+    import warnings
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        Config(config_file=Path("/nonexistent/nope.yaml"))
+    assert any("nope.yaml" in str(w.message) for w in caught), [
+        str(w.message) for w in caught
+    ]
+
+
 def run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
