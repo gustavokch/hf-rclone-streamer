@@ -65,7 +65,7 @@ mkdir -p ~/gdrive
 rclone-fuse mount drive-gkch: ~/gdrive \
     --vfs-cache-mode writes --vfs-cache-max-size 10G --vfs-cache-max-age 1h \
     --vfs-cache-poll-interval 1m --drive-chunk-size 64M --buffer-size 64M \
-	--vfs-read-chunk-size-limit 512M --vfs-read-chunk-size 64M \
+    --vfs-read-chunk-size-limit 512M --vfs-read-chunk-size 64M \
     --low-level-retries 10 --dir-cache-time 1h --attr-timeout 1h \
     --noappledouble --noapplexattr \
     --daemon --log-file ~/rclone.log --log-level INFO
@@ -181,7 +181,8 @@ with `default_model_id` in the config file or `HF_RCLONE_DEFAULT_MODEL_ID`).
 ### Download a specific GGUF quant
 
 GGUF repos bundle many quant variants. `--quant` downloads only the shards
-whose filename contains the tag (case-insensitive; overrides `--include`):
+whose filename contains the tag (the tag is upper-cased before matching;
+overrides `--include`):
 
 ```bash
 # Only *Q4_K_XL*.gguf shards, skipping other quants and mmproj files
