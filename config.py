@@ -5,9 +5,11 @@ Supports environment variable overrides and XDG config directory.
 """
 
 import os
-import json
+import warnings
 from pathlib import Path
 from typing import Optional, Dict, Any
+
+import yaml
 
 
 class Config:
@@ -15,6 +17,9 @@ class Config:
 
     # Default configuration values
     DEFAULTS: Dict[str, Any] = {
+        # Model downloaded when `download` is run without a model ID
+        "default_model_id": "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF",
+        "quant": None,  # GGUF quant filter (e.g. Q4_K_XL); None = all files
         "rclone_path": None,  # Path to rclone mount or config file
         "dest_dir": "/Models",  # Default destination on GDrive
         "cache_dir": "/tmp/hf_cache",  # Temporary cache location
@@ -44,6 +49,8 @@ class Config:
     # Environment variable mappings
     ENV_PREFIX = "HF_RCLONE_"
     ENV_MAPPING: Dict[str, str] = {
+        "default_model_id": "DEFAULT_MODEL_ID",
+        "quant": "QUANT",
         "rclone_path": "RCLONE_PATH",
         "dest_dir": "DEST_DIR",
         "cache_dir": "CACHE_DIR",
@@ -65,7 +72,7 @@ class Config:
         """Initialize configuration.
 
         Args:
-            config_file: Optional path to a JSON configuration file.
+            config_file: Optional path to a YAML configuration file.
         """
         self._config = self.DEFAULTS.copy()
         self._load_from_file(config_file)
@@ -85,24 +92,34 @@ class Config:
         return self.xdg_config_home / "hf-rclone-streamer"
 
     def _load_from_file(self, config_file: Optional[Path] = None) -> None:
-        """Load configuration from a JSON file.
+        """Load configuration from a YAML file.
 
         Args:
             config_file: Path to config file. If None, tries default location.
         """
+        explicit = config_file is not None
         if config_file is None:
-            config_file = self.config_dir / "config.json"
+            config_file = self.config_dir / "config.yaml"
 
         if not config_file.exists():
+            if explicit:
+                warnings.warn(f"Config file not found: {config_file} — using defaults")
+            else:
+                legacy = self.config_dir / "config.json"
+                if legacy.exists():
+                    warnings.warn(
+                        f"Legacy config file {legacy} is no longer read; rename "
+                        f"it to {legacy.with_suffix('.yaml')} to keep your settings"
+                    )
             return
 
         try:
             with open(config_file, "r") as f:
-                user_config = json.load(f)
-                self._config.update(user_config)
-        except (json.JSONDecodeError, IOError) as e:
+                user_config = yaml.safe_load(f)
+                if isinstance(user_config, dict):
+                    self._config.update(user_config)
+        except (yaml.YAMLError, IOError) as e:
             # Don't fail on config file errors, just warn
-            import warnings
             warnings.warn(f"Failed to load config file: {e}")
 
     def _load_from_env(self) -> None:
@@ -166,24 +183,20 @@ class Config:
         """
         self._config.update(updates)
 
-    def save(self, config_file: Optional[Path] = None) -> None:
-        """Save current configuration to a JSON file.
+    @property
+    def default_model_id(self) -> str:
+        """Get the model downloaded when no model ID is given.
 
-        Args:
-            config_file: Path to save config. If None, uses default location.
+        Falls back to DEFAULTS when the stored value is null/empty — a YAML
+        ``default_model_id:`` (no value) stores None and would otherwise leak
+        through as a model ID.
         """
-        if config_file is None:
-            config_file = self.config_dir / "config.json"
+        return self.get("default_model_id") or self.DEFAULTS["default_model_id"]
 
-        # Create config directory if it doesn't exist
-        config_file.parent.mkdir(parents=True, exist_ok=True)
-
-        # Don't save sensitive data like tokens
-        save_config = {k: v for k, v in self._config.items()
-                       if k != "hf_token"}
-
-        with open(config_file, "w") as f:
-            json.dump(save_config, f, indent=2)
+    @property
+    def quant(self) -> Optional[str]:
+        """Get the GGUF quant filter (e.g. 'Q4_K_XL'), or None for all files."""
+        return self.get("quant")
 
     @property
     def rclone_path(self) -> Optional[str]:

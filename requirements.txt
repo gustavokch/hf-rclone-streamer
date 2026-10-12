@@ -8,6 +8,9 @@ huggingface-hub>=0.25.0
 # Rich terminal output with progress bars
 rich>=13.7.0
 
+# YAML config file support (~/.config/hf-rclone-streamer/config.yaml)
+pyyaml>=6.0
+
 # Optional: for enhanced progress bars
 tqdm>=4.66.0
 

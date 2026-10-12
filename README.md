@@ -21,6 +21,7 @@ This was made to facilitate backups of heavy models into Google Drive (or any rc
 
 1. **Python 3.9+**
 2. **aria2c** - Required for high-speed downloads
+
    ```bash
    # macOS
    brew install aria2
@@ -33,6 +34,7 @@ This was made to facilitate backups of heavy models into Google Drive (or any rc
    ```
 
 3. **rclone** - Required for Google Drive operations
+
    ```bash
    # macOS
    brew install rclone
@@ -62,7 +64,8 @@ mkdir -p ~/gdrive
 # Mount in the background with optimized flags (min disk / max throughput)
 rclone-fuse mount drive-gkch: ~/gdrive \
     --vfs-cache-mode writes --vfs-cache-max-size 10G --vfs-cache-max-age 1h \
-    --vfs-cache-poll-interval 1m --drive-chunk-size 64M --buffer-size 32M \
+    --vfs-cache-poll-interval 1m --drive-chunk-size 64M --buffer-size 64M \
+    --vfs-read-chunk-size-limit 512M --vfs-read-chunk-size 64M \
     --low-level-retries 10 --dir-cache-time 1h --attr-timeout 1h \
     --noappledouble --noapplexattr \
     --daemon --log-file ~/rclone.log --log-level INFO
@@ -75,10 +78,10 @@ The `setup` command prints this same optimized command for you.
 The streamer downloads each file to a local cache (`--cache-dir`), then uploads
 it to Google Drive. There are two upload paths:
 
-| Mode | How | Peak local disk | When to use |
-|------|-----|-----------------|-------------|
-| **mount** (default) | Writes through the FUSE mount point (`--rclone-path ~/gdrive`) | ~2× file (cache **+** rclone VFS staging copy) | You want random-access to Drive files via the mount |
-| **`--no-mount`** | `rclone-fuse copyto <file> <remote>:<dest> --drive-chunk-size 64M` | ~1× file (cache only; no VFS duplicate) | Low free disk, or no mount point available |
+| Mode                | How                                                                | Peak local disk                                | When to use                                         |
+| ------------------- | ------------------------------------------------------------------ | ---------------------------------------------- | --------------------------------------------------- |
+| **mount** (default) | Writes through the FUSE mount point (`--rclone-path ~/gdrive`)     | ~2× file (cache **+** rclone VFS staging copy) | You want random-access to Drive files via the mount |
+| **`--no-mount`**    | `rclone-fuse copyto <file> <remote>:<dest> --drive-chunk-size 64M` | ~1× file (cache only; no VFS duplicate)        | Low free disk, or no mount point available          |
 
 With `--no-mount`, no FUSE mount is required — the streamer uploads each cached
 file straight to the remote:
@@ -97,12 +100,14 @@ machine with memory to spare.
 ## Installation
 
 1. Clone this repository:
+
    ```bash
    git clone https://github.com/yourusername/huggingface-rclone-streamer.git
    cd huggingface-rclone-streamer
    ```
 
 2. Install Python dependencies:
+
    ```bash
    pip install -r requirements.txt
    ```
@@ -115,9 +120,14 @@ machine with memory to spare.
 ## Configuration
 
 Configuration can be provided via:
+
 - Command-line arguments
 - Environment variables (prefix: `HF_RCLONE_`)
-- Config file (`~/.config/hf-rclone-streamer/config.json`)
+- YAML config file (`~/.config/hf-rclone-streamer/config.yaml`, or a custom
+  path via `--config <file>`)
+
+Precedence (lowest to highest): built-in defaults < YAML file < environment
+variables < command-line flags. A missing config file is fine — defaults apply.
 
 ### Environment Variables
 
@@ -131,21 +141,27 @@ export HF_RCLONE_RESUME=false                  # Resume capability
 export HF_RCLONE_MAX_RETRIES=3                 # Retry attempts
 export HF_RCLONE_HF_TOKEN=your_token           # HF auth token
 export HF_RCLONE_ARIA2C_CONNECTIONS=16         # aria2c connections
+export HF_RCLONE_DEFAULT_MODEL_ID=...          # Repo used when `download` gets no model ID
+export HF_RCLONE_QUANT=Q4_K_XL                 # GGUF quant filter
 ```
 
 ### Config File Example
 
-```json
-{
-  "rclone_path": "~/gdrive",
-  "dest_dir": "/Models",
-  "cache_dir": "/tmp/hf_cache",
-  "max_shard_size": 5368709120,
-  "cleanup": true,
-  "resume": false,
-  "aria2c_connections": 16
-}
+`~/.config/hf-rclone-streamer/config.yaml`:
+
+```yaml
+rclone_path: ~/gdrive
+dest_dir: /Models
+cache_dir: /tmp/hf_cache
+max_shard_size: 5368709120
+cleanup: true
+resume: false
+aria2c_connections: 16
+default_model_id: huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF
+# quant: Q4_K_XL
 ```
+
+Use a different file with `python run.py --config my.yaml download ...`.
 
 ## Usage
 
@@ -157,6 +173,24 @@ Download a model to your Google Drive mount:
 python hf_rclone_streamer.py download meta-llama/Llama-3.1-8B \
     --rclone-path ~/gdrive
 ```
+
+The model ID is optional: with no argument, `download` pulls the default
+repo (`huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF`, override
+with `default_model_id` in the config file or `HF_RCLONE_DEFAULT_MODEL_ID`).
+
+### Download a specific GGUF quant
+
+GGUF repos bundle many quant variants. `--quant` downloads only the shards
+whose filename contains the tag (the tag is upper-cased before matching;
+overrides `--include`):
+
+```bash
+# Only *Q4_K_XL*.gguf shards, skipping other quants and mmproj files
+python hf_rclone_streamer.py download --quant Q4_K_XL --dest-dir /Models/Qwen
+```
+
+> Note: the match is a substring, so `--quant Q4_XS` also matches `IQ4_XS`
+> files. Pass the full tag (`IQ4_XS`) when you want only that quant.
 
 ### Using rclone Config (No Mount)
 
@@ -244,38 +278,46 @@ python hf_rclone_streamer.py status
 
 ### Global Options
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--rclone-path` | Path to rclone mount or config | Auto-detect |
-| `--cache-dir` | Temporary cache directory | `/tmp/hf_cache` |
-| `--dest-dir` | Destination on GDrive | `/Models` |
-| `--include` | Glob pattern for files to include | `*` |
-| `--exclude` | Glob patterns to exclude | None |
-| `--no-cleanup` | Don't delete cache after upload | False |
-| `--resume` | Resume from existing cache | False |
-| `--hf-token` | Hugging Face auth token | None |
-| `--no-aria2c` | Disable aria2c | False |
-| `--aria2c-connections` | aria2c connections per file | 16 |
-| `--rclone-binary` | rclone binary to invoke | `rclone-fuse` |
-| `--no-mount` | Bypass FUSE mount; upload via `rclone copyto` (½ disk) | False |
-| `--remote` | rclone remote name (no-mount/config mode) | Auto-detect |
-| `--drive-chunk-size` | GDrive upload chunk size | `64M` |
+| Option                 | Description                                            | Default                                    |
+| ---------------------- | ------------------------------------------------------ | ------------------------------------------ |
+| `--config`             | Path to a YAML config file                             | `~/.config/hf-rclone-streamer/config.yaml` |
+| `--rclone-path`        | Path to rclone mount or config                         | Auto-detect                                |
+| `--cache-dir`          | Temporary cache directory                              | `/tmp/hf_cache`                            |
+| `--dest-dir`           | Destination on GDrive                                  | `/Models`                                  |
+| `--include`            | Glob pattern for files to include                      | `*`                                        |
+| `--exclude`            | Glob patterns to exclude                               | None                                       |
+| `--no-cleanup`         | Don't delete cache after upload                        | False                                      |
+| `--resume`             | Resume from existing cache                             | False                                      |
+| `--hf-token`           | Hugging Face auth token                                | None                                       |
+| `--no-aria2c`          | Disable aria2c                                         | False                                      |
+| `--aria2c-connections` | aria2c connections per file                            | 16                                         |
+| `--rclone-binary`      | rclone binary to invoke                                | `rclone-fuse`                              |
+| `--no-mount`           | Bypass FUSE mount; upload via `rclone copyto` (½ disk) | False                                      |
+| `--remote`             | rclone remote name (no-mount/config mode)              | Auto-detect                                |
+| `--drive-chunk-size`   | GDrive upload chunk size                               | `64M`                                      |
 
 ### Commands
 
-#### `download <model_id>`
-Download a model from Hugging Face.
+#### `download [model_id]`
+
+Download a model from Hugging Face. With no model ID, downloads the
+configured `default_model_id`. Options: `--quant <TAG>` (GGUF quant filter,
+e.g. `Q4_K_XL`).
 
 #### `search <query>`
+
 Search for models on Hugging Face Hub.
 
 #### `batch <file>`
+
 Download multiple models from a file.
 
 #### `info <model_id>`
+
 Show information about a model.
 
 #### `status`
+
 Show transfer status and history.
 
 ## Architecture
@@ -301,6 +343,7 @@ Show transfer status and history.
 ### "aria2c not found"
 
 Install aria2c:
+
 ```bash
 # macOS
 brew install aria2
@@ -310,6 +353,7 @@ sudo apt install aria2
 ```
 
 Or disable aria2c:
+
 ```bash
 python hf_rclone_streamer.py download ... --no-aria2c
 ```
@@ -317,6 +361,7 @@ python hf_rclone_streamer.py download ... --no-aria2c
 ### "rclone not found"
 
 Install rclone:
+
 ```bash
 # macOS
 brew install rclone
@@ -327,6 +372,7 @@ brew install rclone
 ### "Mount not accessible"
 
 Check if mount point exists:
+
 ```bash
 ls ~/gdrive
 
@@ -337,6 +383,7 @@ rclone mount gdrive: ~/gdrive --vfs-cache-mode full
 ### Transfer interrupted
 
 Use `--resume` to continue:
+
 ```bash
 python hf_rclone_streamer.py download ... --resume
 ```
@@ -344,6 +391,7 @@ python hf_rclone_streamer.py download ... --resume
 ### Out of space on Google Drive
 
 Check available space:
+
 ```bash
 rclone about gdrive:
 ```
@@ -353,6 +401,7 @@ Delete old models or use a different account.
 ### Slow downloads
 
 Increase aria2c connections:
+
 ```bash
 --aria2c-connections 32
 ```
