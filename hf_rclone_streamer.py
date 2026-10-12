@@ -699,6 +699,25 @@ def build_config(args: argparse.Namespace) -> Config:
     # --quant exists only on the `download` subcommand
     if getattr(args, "quant", None):
         config.set("quant", args.quant)
+
+    # --no-mount needs no FUSE build: any rclone supports `copyto`. When the
+    # default binary is absent, fall back to plain rclone instead of dying
+    # in check_rclone_available(). Gate on the default name so an explicit
+    # --rclone-binary / env / YAML choice fails loud. Mount mode stays strict.
+    if config.no_mount:
+        import shutil
+        binary = config.rclone_binary
+        if (
+            binary == "rclone-fuse"
+            and not shutil.which(binary)
+            and shutil.which("rclone")
+        ):
+            print(
+                f"Note: rclone binary '{binary}' not found; "
+                "falling back to 'rclone' (--no-mount needs no FUSE build)"
+            )
+            config.set("rclone_binary", "rclone")
+
     return config
 
 
