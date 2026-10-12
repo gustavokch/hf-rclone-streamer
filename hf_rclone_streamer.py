@@ -701,12 +701,17 @@ def build_config(args: argparse.Namespace) -> Config:
         config.set("quant", args.quant)
 
     # --no-mount needs no FUSE build: any rclone supports `copyto`. When the
-    # configured binary is absent, fall back to plain rclone instead of dying
-    # in check_rclone_available(). Mount mode stays strict (it needs cmount).
+    # default binary is absent, fall back to plain rclone instead of dying
+    # in check_rclone_available(). Gate on the default name so an explicit
+    # --rclone-binary / env / YAML choice fails loud. Mount mode stays strict.
     if config.no_mount:
         import shutil
         binary = config.rclone_binary
-        if not shutil.which(binary) and shutil.which("rclone"):
+        if (
+            binary == "rclone-fuse"
+            and not shutil.which(binary)
+            and shutil.which("rclone")
+        ):
             print(
                 f"Note: rclone binary '{binary}' not found; "
                 "falling back to 'rclone' (--no-mount needs no FUSE build)"

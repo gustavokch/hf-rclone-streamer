@@ -169,6 +169,18 @@ def test_build_config_mount_mode_never_falls_back():
     assert cfg.rclone_binary == "rclone-fuse", f"binary: {cfg.rclone_binary!r}"
 
 
+def test_build_config_no_mount_respects_explicit_binary():
+    """Explicit --rclone-binary that is missing must NOT be swapped for
+    plain rclone: the user chose that binary, so fail loud instead."""
+    args = create_parser().parse_args(
+        ["--no-mount", "--rclone-binary", "rclone-custom", "download"]
+    )
+    cfg = _build_config_with_which(
+        args, {"rclone-custom": None, "rclone": "/usr/bin/rclone"}
+    )
+    assert cfg.rclone_binary == "rclone-custom", f"binary: {cfg.rclone_binary!r}"
+
+
 def test_build_config_no_fallback_when_no_rclone_either():
     """Both binaries missing: keep the configured name so the existing
     RcloneNotFoundError hint (setup-fuse / --rclone-binary) still fires."""
