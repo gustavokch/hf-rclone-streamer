@@ -91,19 +91,19 @@ Examples:
     parser.add_argument(
         "--cache-dir",
         type=str,
-        default="/tmp/hf_cache",
+        default=None,
         help="Temporary cache directory (default: /tmp/hf_cache)",
     )
     parser.add_argument(
         "--dest-dir",
         type=str,
-        default="/Models",
+        default=None,
         help="Destination directory on GDrive (default: /Models)",
     )
     parser.add_argument(
         "--include",
         type=str,
-        default="*",
+        default=None,
         help="Glob pattern for files to include (default: *)",
     )
     parser.add_argument(
@@ -135,7 +135,7 @@ Examples:
     parser.add_argument(
         "--aria2c-connections",
         type=int,
-        default=16,
+        default=None,
         help="Number of connections per file for aria2c (default: 16)",
     )
 
@@ -159,7 +159,7 @@ Examples:
     parser.add_argument(
         "--drive-chunk-size",
         type=str,
-        default="64M",
+        default=None,
         help="GDrive upload chunk size, e.g. 64M or 128M (default: 64M)",
     )
 
@@ -652,6 +652,56 @@ def cmd_setup(args: argparse.Namespace, config: Config) -> int:
     return run_setup()
 
 
+def build_config(args: argparse.Namespace) -> Config:
+    """Build the Config for this invocation: YAML file < env < CLI flags.
+
+    Extracted from ``main()`` so the flag→config wiring is testable without
+    running the full command dispatch.
+
+    Args:
+        args: Parsed arguments (global flags plus the download-only ``--quant``).
+
+    Returns:
+        Config with CLI overrides applied.
+    """
+    config = Config(config_file=Path(args.config) if args.config else None)
+    # Value flags: None = "not given" → keep YAML/env/DEFAULTS (argparse
+    # defaults are None precisely so an absent flag never clobbers them).
+    # Boolean store_true flags only set when True (absent = False = no-op).
+    if args.rclone_path is not None:
+        config.set("rclone_path", args.rclone_path)
+    if args.cache_dir is not None:
+        config.set("cache_dir", args.cache_dir)
+    if args.dest_dir is not None:
+        config.set("dest_dir", args.dest_dir)
+    if args.include is not None:
+        config.set("include", args.include)
+    if args.exclude is not None:
+        config.set("exclude", args.exclude)
+    if args.no_cleanup:
+        config.set("cleanup", False)
+    if args.resume:
+        config.set("resume", True)
+    if args.hf_token is not None:
+        config.set("hf_token", args.hf_token)
+    if args.no_aria2c:
+        config.set("use_aria2c", False)
+    if args.aria2c_connections is not None:
+        config.set("aria2c_connections", args.aria2c_connections)
+    if args.no_mount:
+        config.set("no_mount", True)
+    if args.remote is not None:
+        config.set("remote", args.remote)
+    if args.rclone_binary is not None:
+        config.set("rclone_binary", args.rclone_binary)
+    if args.drive_chunk_size is not None:
+        config.set("drive_chunk_size", args.drive_chunk_size)
+    # --quant exists only on the `download` subcommand
+    if getattr(args, "quant", None):
+        config.set("quant", args.quant)
+    return config
+
+
 def main() -> int:
     """Main entry point.
 
@@ -666,38 +716,7 @@ def main() -> int:
         return 0
 
     # Build config from args
-    config = Config(config_file=Path(args.config) if args.config else None)
-    if args.rclone_path:
-        config.set("rclone_path", args.rclone_path)
-    if args.cache_dir:
-        config.set("cache_dir", args.cache_dir)
-    if args.dest_dir:
-        config.set("dest_dir", args.dest_dir)
-    if args.include:
-        config.set("include", args.include)
-    if args.exclude:
-        config.set("exclude", args.exclude)
-    if args.no_cleanup:
-        config.set("cleanup", False)
-    if args.resume:
-        config.set("resume", True)
-    if args.hf_token:
-        config.set("hf_token", args.hf_token)
-    if args.no_aria2c:
-        config.set("use_aria2c", False)
-    if args.aria2c_connections:
-        config.set("aria2c_connections", args.aria2c_connections)
-    if args.no_mount:
-        config.set("no_mount", True)
-    if args.remote:
-        config.set("remote", args.remote)
-    if args.rclone_binary:
-        config.set("rclone_binary", args.rclone_binary)
-    if args.drive_chunk_size:
-        config.set("drive_chunk_size", args.drive_chunk_size)
-    # --quant exists only on the `download` subcommand
-    if getattr(args, "quant", None):
-        config.set("quant", args.quant)
+    config = build_config(args)
 
     # Point rclone_client at the configured binary
     set_rclone_binary(config.rclone_binary)

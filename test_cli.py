@@ -75,6 +75,56 @@ def test_help_shows_configured_default_model():
     assert Config.DEFAULTS["default_model_id"] in flat, download_help
 
 
+def test_build_config_quant_flag_sets_config():
+    """--quant on `download` must land in the built config (main() wiring)."""
+    from hf_rclone_streamer import build_config  # not extracted yet → red
+    with tempfile.TemporaryDirectory() as td:
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": td}, clear=True):
+            args = create_parser().parse_args(["download", "--quant", "q4_k_xl"])
+            cfg = build_config(args)
+    assert cfg.quant == "q4_k_xl", f"quant: {cfg.quant!r}"
+
+
+def test_build_config_explicit_yaml_loaded():
+    """--config <path> must load that YAML file into the built config."""
+    from hf_rclone_streamer import build_config  # not extracted yet → red
+    with tempfile.TemporaryDirectory() as td:
+        cfg_path = Path(td) / "c.yaml"
+        cfg_path.write_text("dest_dir: /Models/X\n")
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": td}, clear=True):
+            args = create_parser().parse_args(["--config", str(cfg_path), "download"])
+            cfg = build_config(args)
+    assert cfg.dest_dir == "/Models/X", f"dest_dir: {cfg.dest_dir!r}"
+
+
+def test_build_config_env_dest_dir_survives():
+    """HF_RCLONE_DEST_DIR must survive when the --dest-dir flag is absent."""
+    from hf_rclone_streamer import build_config
+    with tempfile.TemporaryDirectory() as td:
+        with mock.patch.dict(
+            os.environ,
+            {"XDG_CONFIG_HOME": td, "HF_RCLONE_DEST_DIR": "/EnvWins"},
+            clear=True,
+        ):
+            args = create_parser().parse_args(["download"])
+            cfg = build_config(args)
+    assert cfg.dest_dir == "/EnvWins", f"dest_dir: {cfg.dest_dir!r}"
+
+
+def test_build_config_cli_dest_dir_wins_over_yaml():
+    """An explicit --dest-dir flag must override the YAML file."""
+    from hf_rclone_streamer import build_config
+    with tempfile.TemporaryDirectory() as td:
+        cfg_path = Path(td) / "c.yaml"
+        cfg_path.write_text("dest_dir: /Models/X\n")
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": td}, clear=True):
+            args = create_parser().parse_args(
+                ["--config", str(cfg_path), "--dest-dir", "/CliWins", "download"]
+            )
+            cfg = build_config(args)
+    assert cfg.dest_dir == "/CliWins", f"dest_dir: {cfg.dest_dir!r}"
+
+
 def run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
