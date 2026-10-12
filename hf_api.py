@@ -437,12 +437,15 @@ def get_model_info(
         # Get model metadata
         model_data = api.model_info(model_id, revision=revision)
 
-        # Get file list
+        # Get file list (recursive: GGUF repos keep quant shards in
+        # subfolders like "unsloth-UD-Q4_K_XL/", which a top-level listing
+        # misses)
         repo_tree = list_repo_tree(
             repo_id=model_id,
             revision=revision,
             token=token,
             repo_type="model",
+            recursive=True,
         )
 
         files = []

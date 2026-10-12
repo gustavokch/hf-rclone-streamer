@@ -78,6 +78,12 @@ Examples:
 
     # Global options
     parser.add_argument(
+        "--config",
+        type=str,
+        help="Path to a YAML config file (default: "
+        "~/.config/hf-rclone-streamer/config.yaml if present)",
+    )
+    parser.add_argument(
         "--rclone-path",
         type=str,
         help="Path to rclone mount or config file",
@@ -168,7 +174,17 @@ Examples:
     download_parser.add_argument(
         "model_id",
         type=str,
-        help="Model ID (e.g., meta-llama/Llama-3.1-8B)",
+        nargs="?",
+        default=None,
+        help="Model ID (default: huihui-ai/"
+        "Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF)",
+    )
+    download_parser.add_argument(
+        "--quant",
+        type=str,
+        default=None,
+        help="Only download GGUF files whose name contains this quant tag "
+        "(e.g. Q4_K_XL); overrides --include",
     )
 
     # Search command
@@ -257,6 +273,22 @@ Examples:
     return parser
 
 
+def quant_include_pattern(quant: Optional[str]) -> Optional[List[str]]:
+    """Translate a GGUF quant tag into an include pattern for file filtering.
+
+    Args:
+        quant: Quant tag such as "Q4_K_XL" (case-insensitive), or None.
+
+    Returns:
+        ["*<QUANT>*.gguf"] with the tag upper-cased, or None when no quant
+        is given (caller keeps its normal include patterns). Substring match:
+        "Q4_XS" also matches files tagged "IQ4_XS".
+    """
+    if not quant:
+        return None
+    return [f"*{quant.strip().upper()}*.gguf"]
+
+
 def cmd_download(args: argparse.Namespace, config: Config) -> int:
     """Handle the download command.
 
@@ -267,7 +299,7 @@ def cmd_download(args: argparse.Namespace, config: Config) -> int:
     Returns:
         Exit code.
     """
-    model_id = args.model_id
+    model_id = args.model_id or config.default_model_id
 
     print(f"Preparing to download: {model_id}")
     print(f"Cache directory: {config.cache_dir}")
@@ -330,7 +362,9 @@ def cmd_download(args: argparse.Namespace, config: Config) -> int:
     manager = TransferManager(config=config, progress_callback=progress_callback)
 
     # Start transfer
-    include_patterns = [config.include_pattern]
+    include_patterns = quant_include_pattern(config.quant) or [
+        config.include_pattern
+    ]
     exclude_patterns = config.exclude_patterns
 
     success = manager.transfer_model(
@@ -633,7 +667,7 @@ def main() -> int:
         return 0
 
     # Build config from args
-    config = Config()
+    config = Config(config_file=Path(args.config) if args.config else None)
     if args.rclone_path:
         config.set("rclone_path", args.rclone_path)
     if args.cache_dir:
@@ -662,6 +696,9 @@ def main() -> int:
         config.set("rclone_binary", args.rclone_binary)
     if args.drive_chunk_size:
         config.set("drive_chunk_size", args.drive_chunk_size)
+    # --quant exists only on the `download` subcommand
+    if getattr(args, "quant", None):
+        config.set("quant", args.quant)
 
     # Point rclone_client at the configured binary
     set_rclone_binary(config.rclone_binary)
