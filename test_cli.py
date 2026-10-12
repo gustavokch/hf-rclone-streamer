@@ -125,6 +125,58 @@ def test_build_config_cli_dest_dir_wins_over_yaml():
     assert cfg.dest_dir == "/CliWins", f"dest_dir: {cfg.dest_dir!r}"
 
 
+def _build_config_with_which(args, which_map):
+    """Build config while stubbing shutil.which with {name: path-or-None}."""
+    from hf_rclone_streamer import build_config
+    with tempfile.TemporaryDirectory() as td:
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": td}, clear=True):
+            with mock.patch(
+                "shutil.which", side_effect=lambda name: which_map.get(name)
+            ):
+                return build_config(args)
+
+
+def test_build_config_no_mount_falls_back_to_rclone():
+    """--no-mount with rclone-fuse absent must fall back to plain rclone."""
+    import io
+    from contextlib import redirect_stdout
+    parser = create_parser()
+    args = parser.parse_args(["--no-mount", "download"])
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        cfg = _build_config_with_which(
+            args, {"rclone-fuse": None, "rclone": "/usr/bin/rclone"}
+        )
+    assert cfg.rclone_binary == "rclone", f"binary: {cfg.rclone_binary!r}"
+    assert "falling back" in buf.getvalue(), buf.getvalue()
+
+
+def test_build_config_no_mount_keeps_fuse_binary_when_present():
+    """--no-mount with rclone-fuse on PATH must not swap the binary."""
+    args = create_parser().parse_args(["--no-mount", "download"])
+    cfg = _build_config_with_which(
+        args, {"rclone-fuse": "/usr/local/bin/rclone-fuse", "rclone": "/usr/bin/rclone"}
+    )
+    assert cfg.rclone_binary == "rclone-fuse", f"binary: {cfg.rclone_binary!r}"
+
+
+def test_build_config_mount_mode_never_falls_back():
+    """Mount mode needs the FUSE build: no fallback even if rclone exists."""
+    args = create_parser().parse_args(["download"])
+    cfg = _build_config_with_which(
+        args, {"rclone-fuse": None, "rclone": "/usr/bin/rclone"}
+    )
+    assert cfg.rclone_binary == "rclone-fuse", f"binary: {cfg.rclone_binary!r}"
+
+
+def test_build_config_no_fallback_when_no_rclone_either():
+    """Both binaries missing: keep the configured name so the existing
+    RcloneNotFoundError hint (setup-fuse / --rclone-binary) still fires."""
+    args = create_parser().parse_args(["--no-mount", "download"])
+    cfg = _build_config_with_which(args, {"rclone-fuse": None, "rclone": None})
+    assert cfg.rclone_binary == "rclone-fuse", f"binary: {cfg.rclone_binary!r}"
+
+
 def run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -90,6 +90,10 @@ file straight to the remote:
 python run.py --no-mount --remote drive-gkch download meta-llama/Llama-3.1-8B
 ```
 
+No FUSE build needed: if `rclone-fuse` is not on PATH, the streamer falls
+back to plain `rclone` automatically (any rclone build supports `copyto`).
+Mount mode still requires the FUSE build (`python run.py setup-fuse`).
+
 `--drive-chunk-size` (default `64M`) is the main throughput lever for Google
 Drive uploads: larger chunks mean fewer API round-trips. Raise it to `128M` on a
 machine with memory to spare.
