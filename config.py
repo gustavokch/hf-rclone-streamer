@@ -102,7 +102,9 @@ class Config:
             config_file = self.config_dir / "config.yaml"
 
         if not config_file.exists():
-            if not explicit:
+            if explicit:
+                warnings.warn(f"Config file not found: {config_file} — using defaults")
+            else:
                 legacy = self.config_dir / "config.json"
                 if legacy.exists():
                     warnings.warn(

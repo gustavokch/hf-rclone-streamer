@@ -101,6 +101,16 @@ def test_missing_explicit_config_warns():
     ]
 
 
+def test_default_model_id_null_falls_back():
+    """`default_model_id: null` in YAML stores None (key exists) — property must fall back."""
+    with tempfile.TemporaryDirectory() as td:
+        path = _write_yaml(Path(td), "default_model_id:\n")
+        cfg = Config(config_file=path)
+    assert cfg.default_model_id == (
+        "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF"
+    ), f"default_model_id: {cfg.default_model_id!r}"
+
+
 def run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
