@@ -176,8 +176,7 @@ Examples:
         type=str,
         nargs="?",
         default=None,
-        help="Model ID (default: huihui-ai/"
-        "Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF)",
+        help=f"Model ID (default: {Config.DEFAULTS['default_model_id']})",
     )
     download_parser.add_argument(
         "--quant",

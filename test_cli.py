@@ -10,6 +10,9 @@ Run: .venv/bin/python test_cli.py
 """
 import os
 import sys
+import tempfile
+from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -55,6 +58,21 @@ def test_quant_pattern_uppercases():
 
 def test_quant_pattern_none():
     assert quant_include_pattern(None) is None
+
+
+def test_help_shows_configured_default_model():
+    """`download --help` must reference the live default repo, not a stale literal."""
+    import argparse
+    from config import Config
+    parser = create_parser()
+    subaction = next(
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+    )
+    download_help = subaction.choices["download"].format_help()
+    # HelpFormatter wraps long tokens across lines; drop all whitespace to
+    # reassemble the default repo ID before matching.
+    flat = "".join(download_help.split())
+    assert Config.DEFAULTS["default_model_id"] in flat, download_help
 
 
 def run():
