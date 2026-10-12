@@ -19,7 +19,7 @@ if str(script_dir) not in sys.path:
 try:
     from .config import Config, get_config
     from .hf_api import search_models, get_model_info, format_size, print_model_summary
-    from .transfer_manager import TransferManager, TransferProgress
+    from .transfer_manager import TransferManager, TransferProgress, progress_line_clear
     from .rate_estimator import format_rate, format_eta
     from .rclone_client import (
         detect_mode,
@@ -33,7 +33,7 @@ except ImportError:
     # Running directly (not as a module)
     from config import Config, get_config
     from hf_api import search_models, get_model_info, format_size, print_model_summary
-    from transfer_manager import TransferManager, TransferProgress
+    from transfer_manager import TransferManager, TransferProgress, progress_line_clear
     from rate_estimator import format_rate, format_eta
     from rclone_client import (
         detect_mode,
@@ -344,9 +344,9 @@ def cmd_download(args: argparse.Namespace, config: Config) -> int:
         # the parens) and the completion ETA. During warmup the trailing fields
         # read "—" and "ETA calculating…". The leading \r redraws in place, so
         # clear to end-of-line when the new content is shorter than the last
-        # (e.g. warmup after a retry) — but only on a TTY, else redirected
-        # output would be polluted with escape codes.
-        clear = "\033[K" if sys.stdout.isatty() else ""
+        # (e.g. warmup after a retry) — progress_line_clear() returns "" when
+        # stdout is not a TTY, so redirected output gets no escape codes.
+        clear = progress_line_clear()
         print(
             f"\rProgress: {progress.completed_files}/{progress.total_files} files | "
             f"DL: {format_size(progress.downloaded_bytes)}/{format_size(progress.total_bytes)} "
@@ -373,7 +373,7 @@ def cmd_download(args: argparse.Namespace, config: Config) -> int:
         exclude_patterns=exclude_patterns,
     )
 
-    print()  # New line after progress
+    manager.finish_progress_line()  # Close the in-place progress line if open
 
     if success:
         print("Transfer completed successfully!")
